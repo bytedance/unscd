@@ -58,7 +58,7 @@ resource leaks and hangs in NSS libraries.
 
 It is also many times smaller.
 
-Currently (v0.34) it emulates glibc nscd pretty closely
+Currently (v0.36) it emulates glibc nscd pretty closely
 (handles same command line flags and config file), and is moderately tested.
 
 Please note that as of 2008-08 it is not in wide use (yet?).
@@ -117,8 +117,11 @@ vda.linux@googlemail.com
  * 0.34 create /var/run/nscd/nscd.pid pidfile like glibc nscd 2.8 does;
  *      delay setuid'ing itself to server-user after log and pidfile are open
  * 0.35 readlink /proc/self/exe and use result if execing /proc/self/exe fails
+ * 0.36 excercise extreme paranoia handling server-user option;
+ *      a little bit more verbose logging:
+ *      L_DEBUG2 log level added, use debug-level 7 to get it
  */
-#define PROGRAM_VERSION "0.35"
+#define PROGRAM_VERSION "0.36"
 
 #define DEBUG_BUILD 1
 
@@ -137,12 +140,15 @@ typedef signed char smallint;
 #endif
 
 
-#define	L_INFO   (1 << 0)
-#define	L_DEBUG  ((1 << 1) * DEBUG_BUILD) /* set to const 0 in production build */
-#define	L_DUMP   ((1 << 2) * DEBUG_BUILD) /* set to const 0 in production build */
-#define	L_ALL    0xf
-#define	D_DAEMON (1 << 6)
-#define	D_STAMP  (1 << 5)
+enum {
+	L_INFO   = (1 << 0),
+	L_DEBUG  = ((1 << 1) * DEBUG_BUILD),
+	L_DEBUG2 = ((1 << 2) * DEBUG_BUILD),
+	L_DUMP   = ((1 << 3) * DEBUG_BUILD),
+	L_ALL    = 0xf,
+	D_DAEMON = (1 << 6),
+	D_STAMP  = (1 << 5),
+};
 
 static smallint debug = D_DAEMON;
 
@@ -223,7 +229,7 @@ static void nscd_log(int mask, const char *msg, ...)
 
 #define log(lvl, ...) do { if (lvl) nscd_log(lvl, __VA_ARGS__); } while (0)
 
-#if L_DUMP
+#if DEBUG_BUILD
 static void dump(const void *ptr, int len)
 {
 	char text[18];
@@ -283,7 +289,7 @@ static void xexecve(const char *filename, char **argv, char **envp)
 
 static void ndelay_on(int fd)
 {
-	int fl = fcntl(fd, F_GETFL, 0);
+	int fl = fcntl(fd, F_GETFL);
 	if (fl < 0)
 		perror_and_die("F_GETFL");
 	if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0)
@@ -301,7 +307,7 @@ static unsigned monotonic_ms(void)
 	struct timespec ts;
 	if (syscall(__NR_clock_gettime, CLOCK_MONOTONIC, &ts))
 		perror_and_die("clock_gettime(MONOTONIC)");
-	return ts.tv_sec * 1000 + ts.tv_nsec/1000000;
+	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static unsigned strsize(const char *str)
@@ -383,12 +389,12 @@ static ssize_t full_write(int fd, const void *buf, size_t len)
 static void xsafe_write(int fd, const void *buf, size_t count)
 {
 	if (count != safe_write(fd, buf, count))
-		perror_and_die("short write");
+		perror_and_die("short write of %ld bytes", (long)count);
 }
 static void xfull_write(int fd, const void *buf, size_t count)
 {
 	if (count != full_write(fd, buf, count))
-		perror_and_die("short write");
+		perror_and_die("short write of %ld bytes", (long)count);
 }
 
 static void xmovefd(int from_fd, int to_fd)
@@ -557,27 +563,29 @@ enum {
 	GETFDSERV,
 	LASTREQ
 };
-#if L_DEBUG
+#if DEBUG_BUILD
 static const char *const typestr[] = {
-	"GETPWBYNAME",     // done
-	"GETPWBYUID",      // done
-	"GETGRBYNAME",     // done
-	"GETGRBYGID",      // done
-	"GETHOSTBYNAME",   // done
-	"GETHOSTBYNAMEv6", // done
-	"GETHOSTBYADDR",   // done
-	"GETHOSTBYADDRv6", // done
-	"SHUTDOWN",        // done
-	"GETSTAT",         // info?
-	"INVALIDATE",      // done
-	"GETFDPW",         // won't do: nscd passes a name of shmem segment which client can map and "see" the db.
-	"GETFDGR",         // won't do
-	"GETFDHST",        // won't do
-	"GETAI",           // done
-	"INITGROUPS",      // done
-	"GETSERVBYNAME",   // prio 3 (no caching?)
-	"GETSERVBYPORT",   // prio 3 (no caching?)
-	"GETFDSERV"        // won't do
+	"GETPWBYNAME",     /* done */
+	"GETPWBYUID",      /* done */
+	"GETGRBYNAME",     /* done */
+	"GETGRBYGID",      /* done */
+	"GETHOSTBYNAME",   /* done */
+	"GETHOSTBYNAMEv6", /* done */
+	"GETHOSTBYADDR",   /* done */
+	"GETHOSTBYADDRv6", /* done */
+	"SHUTDOWN",        /* done */
+	"GETSTAT",         /* info? */
+	"INVALIDATE",      /* done */
+	/* won't do: nscd passes a name of shmem segment
+	 * which client can map and "see" the db */
+	"GETFDPW",
+	"GETFDGR",         /* won't do */
+	"GETFDHST",        /* won't do */
+	"GETAI",           /* done */
+	"INITGROUPS",      /* done */
+	"GETSERVBYNAME",   /* prio 3 (no caching?) */
+	"GETSERVBYPORT",   /* prio 3 (no caching?) */
+	"GETFDSERV"        /* won't do */
 };
 #else
 extern const char *const typestr[];
@@ -699,12 +707,12 @@ typedef struct initgr_response_header {
 	int32_t ngrps;
 	/* code assumes gid_t == int32, let's check that */
 	int32_t gid[sizeof(gid_t) == sizeof(int32_t) ? 0 : -1];
-	// char user_str[as_needed];
+	/* char user_str[as_needed]; */
 } initgr_response_header;
 
 static initgr_response_header *obtain_initgroups(const char *username)
 {
-	struct initgr_response_header *resp = NULL;
+	struct initgr_response_header *resp;
 	struct passwd *pw;
 	enum { MAGIC_OFFSET = sizeof(*resp) / sizeof(int32_t) };
 	unsigned sz;
@@ -719,7 +727,10 @@ static initgr_response_header *obtain_initgroups(const char *username)
 		goto ret;
 	}
 
-	ngroups = 64;
+	/* getgrouplist may be very expensive, it's much better to allocate
+	 * a bit more than to run getgrouplist twice */
+	ngroups = 128;
+	resp = NULL;
 	do {
 		sz = sizeof(*resp) + sizeof(resp->gid[0]) * ngroups;
 		resp = xrealloc(resp, sz);
@@ -745,11 +756,11 @@ typedef struct pw_response_header {
 	int32_t pw_gecos_len;
 	int32_t pw_dir_len;
 	int32_t pw_shell_len;
-	// char pw_name[pw_name_len];
-	// char pw_passwd[pw_passwd_len];
-	// char pw_gecos[pw_gecos_len];
-	// char pw_dir[pw_dir_len];
-	// char pw_shell[pw_shell_len];
+	/* char pw_name[pw_name_len]; */
+	/* char pw_passwd[pw_passwd_len]; */
+	/* char pw_gecos[pw_gecos_len]; */
+	/* char pw_dir[pw_dir_len]; */
+	/* char pw_shell[pw_shell_len]; */
 } pw_response_header;
 
 static pw_response_header *marshal_passwd(struct passwd *pw)
@@ -797,16 +808,16 @@ static pw_response_header *marshal_passwd(struct passwd *pw)
 typedef struct gr_response_header {
 	uint32_t version_or_size;
 	int32_t found;
-	int32_t gr_name_len;    // strlen(gr->gr_name) + 1;
-	int32_t gr_passwd_len;  // strlen(gr->gr_passwd) + 1;
-	int32_t gr_gid;         // gr->gr_gid
-	int32_t gr_mem_cnt;     // while (gr->gr_mem[gr_mem_cnt]) ++gr_mem_cnt;
-	// int32_t gr_mem_len[gr_mem_cnt];
-	// char gr_name[gr_name_len];
-	// char gr_passwd[gr_passwd_len];
-	// char gr_mem[gr_mem_cnt][gr_mem_len[i]];
-	// char gr_gid_str[as_needed]; - huh?
-	// char orig_key[as_needed]; - needed?? I don't do this ATM...
+	int32_t gr_name_len;    /* strlen(gr->gr_name) + 1; */
+	int32_t gr_passwd_len;  /* strlen(gr->gr_passwd) + 1; */
+	int32_t gr_gid;         /* gr->gr_gid */
+	int32_t gr_mem_cnt;     /* while (gr->gr_mem[gr_mem_cnt]) ++gr_mem_cnt; */
+	/* int32_t gr_mem_len[gr_mem_cnt]; */
+	/* char gr_name[gr_name_len]; */
+	/* char gr_passwd[gr_passwd_len]; */
+	/* char gr_mem[gr_mem_cnt][gr_mem_len[i]]; */
+	/* char gr_gid_str[as_needed]; - huh? */
+	/* char orig_key[as_needed]; - needed?? I don't do this ATM... */
 /*
  glibc adds gr_gid_str, but client doesn't get/use it:
  writev(3, [{"\2\0\0\0\2\0\0\0\5\0\0\0", 12}, {"root\0", 5}], 2) = 17
@@ -846,20 +857,20 @@ static gr_response_header *marshal_group(struct group *gr)
 	resp->gr_gid = gr->gr_gid;
 	resp->gr_mem_cnt = gr_mem_cnt;
 	p = (char*)(resp + 1);
-// int32_t gr_mem_len[gr_mem_cnt];
+/* int32_t gr_mem_len[gr_mem_cnt]; */
 	gr_mem_cnt = 0;
 	while (gr->gr_mem[gr_mem_cnt]) {
 		*(uint32_t*)p = strsize(gr->gr_mem[gr_mem_cnt]);
 		p += 4;
 		gr_mem_cnt++;
 	}
-// char gr_name[gr_name_len];
+/* char gr_name[gr_name_len]; */
 	strcpy(p, gr->gr_name);
 	p += strsize(gr->gr_name);
-// char gr_passwd[gr_passwd_len];
+/* char gr_passwd[gr_passwd_len]; */
 	strcpy(p, gr->gr_passwd);
 	p += strsize(gr->gr_passwd);
-// char gr_mem[gr_mem_cnt][gr_mem_len[i]];
+/* char gr_mem[gr_mem_cnt][gr_mem_len[i]]; */
 	gr_mem_cnt = 0;
 	while (gr->gr_mem[gr_mem_cnt]) {
 		strcpy(p, gr->gr_mem[gr_mem_cnt]);
@@ -895,18 +906,22 @@ static hst_response_header *marshal_hostent(struct hostent *h)
 	unsigned h_addr_list_cnt;
 	unsigned sz = sizeof(*resp);
 	if (h) {
-		sz += h_name_len = strsize_aligned4(h->h_name); // char h_name[h_name_len]
+/* char h_name[h_name_len] */
+		sz += h_name_len = strsize_aligned4(h->h_name);
 		h_addr_list_cnt = 0;
 		while (h->h_addr_list[h_addr_list_cnt]) {
 			h_addr_list_cnt++;
 		}
-		sz += h_addr_list_cnt * h->h_length; // char h_addr_list[h_addr_list_cnt][h_length]
+/* char h_addr_list[h_addr_list_cnt][h_length] */
+		sz += h_addr_list_cnt * h->h_length;
 		h_aliases_cnt = 0;
 		while (h->h_aliases[h_aliases_cnt]) {
-			sz += strsize(h->h_aliases[h_aliases_cnt]); // char h_aliases[h_aliases_cnt][h_aliases_len[i]]
+/* char h_aliases[h_aliases_cnt][h_aliases_len[i]] */
+			sz += strsize(h->h_aliases[h_aliases_cnt]);
 			h_aliases_cnt++;
 		}
-		sz += h_aliases_cnt * 4; // uint32_t h_aliases_len[h_aliases_cnt]
+/* uint32_t h_aliases_len[h_aliases_cnt] */
+		sz += h_aliases_cnt * 4;
 	}
 	resp = xzalloc(sz);
 	resp->version_or_size = sz;
@@ -1240,7 +1255,7 @@ static int create_and_feed_worker(user_req *ureq)
 
 static user_req *worker_ureq;
 
-#if L_DEBUG
+#if DEBUG_BUILD
 static const char *req_str(unsigned type, const char *buf)
 {
 	if (type == GETHOSTBYADDR) {
@@ -1259,7 +1274,7 @@ const char *req_str(unsigned type, const char *buf);
 
 static void worker_signal_handler(int sig)
 {
-#if L_DEBUG
+#if DEBUG_BUILD
 	log(L_INFO, "worker:%d got sig:%d while handling req "
 		"type:%d(%s) key_len:%d '%s'",
 		getpid(), sig,
@@ -1480,20 +1495,21 @@ static void handle_worker_response(int i, unsigned now_ms)
 		log(L_DEBUG, "worker gave short reply:%u != 8", resp_sz);
 		goto err;
 	}
+
 	resp_sz = sz_and_found.version_or_size;
 	if (resp_sz < 8 || resp_sz > 0xfffffff) { /* 256 mb */
 		error("BUG: bad size from worker:%u", resp_sz);
 		goto err;
 	}
 
-	/* create new block of cached info */
+	/* Create new block of cached info */
 	cached = xzalloc(ureq_sz_aligned + resp_sz);
 	resp = (void*) ((char*)cached + ureq_sz_aligned);
 	memcpy(cached, ureq, ureq_size(ureq));
 	resp->version_or_size = resp_sz;
 	resp->found = sz_and_found.found;
 	if (sz_and_found.found) {
-		/* we need to read data only if it's found
+		/* We need to read data only if it's found
 		 * (otherwise worker sends only 8 bytes) */
 		if (full_read(pfd[i].fd, resp->body, resp_sz - 8) != resp_sz - 8) {
 			/* worker was killed? */
@@ -1544,7 +1560,7 @@ static void main_loop(void)
 
 		r = SMALL_POLL_TIMEOUT_MS;
 		if (num_clients <= 2 && !cached_cnt)
-			r = -1;
+			r = -1; /* infinite */
 		else if (num_clients < max_reqnum)
 			r = aging_interval_ms;
 
@@ -1558,9 +1574,13 @@ static void main_loop(void)
 				cnt, r, num_clients, cached_cnt, cache_hit_cnt, cache_access_cnt, p, s);
 			cnt++;
 		}
+#else
+		log(L_DEBUG, "entering poll (%d ms). num_clients:%u cached:%u hit_ratio:%u/%u",
+				r, num_clients, cached_cnt, cache_hit_cnt, cache_access_cnt);
 #endif
 
 		r = poll(pfd, num_clients, r);
+		log(L_DEBUG2, "poll returns %d", r);
 		if (r < 0) {
 			if (errno != EINTR)
 				perror_and_die("poll");
@@ -1583,6 +1603,7 @@ static void main_loop(void)
 			cfd = accept(pfd[i].fd, NULL, NULL);
 			if (cfd < 0) {
 				/* odd... poll() says we can accept but accept failed? */
+				log(L_DEBUG2, "accept failed with %s", strerror(errno));
 				continue;
 			}
 			ndelay_on(cfd);
@@ -1607,6 +1628,7 @@ static void main_loop(void)
 		for (; i < num_clients; i++) {
 			if (!pfd[i].revents)
 				continue;
+			log(L_DEBUG2, "pfd[%d].revents:0x%x", i, pfd[i].revents);
 			/* pfd[i].revents = 0; - not needed */
 
 			/* "Write out result" case */
@@ -1650,7 +1672,7 @@ static void main_loop(void)
 			/* "Read reply from worker" case. Worker may be
 			 * already dead, revents may contain other bits too */
 			if ((pfd[i].revents & POLLIN) && cinfo[i].client_fd) {
-				log(L_DEBUG, "reading response from child %u", i);
+				log(L_DEBUG, "reading response for client %u", i);
 				handle_worker_response(i, now_ms);
 				/* We can immediately try to write a response
 				 * to client */
@@ -1668,6 +1690,7 @@ static void main_loop(void)
 			/* "Read request from client" case */
 			r = safe_read(pfd[i].fd, (char*)(cinfo[i].ureq) + cinfo[i].bytecnt, MAX_USER_REQ_SIZE - cinfo[i].bytecnt);
 			if (r < 0) {
+				log(L_DEBUG2, "error reading from client: %s", strerror(errno));
 				if (errno == EAGAIN)
 					continue;
 				close_client(i);
@@ -1726,13 +1749,13 @@ static void main_loop(void)
 		} /* for each client[2..num_clients-1] */
 
  skip_fd_checks:
-		/* age cache */
+		/* Age cache */
 		if ((now_ms - last_age_time) >= aging_interval_ms) {
 			last_age_time = now_ms;
 			age_cache(now_ms, -1);
 		}
 
-		/* close timed out client connections */
+		/* Close timed out client connections */
 		for (i = 2; i < num_clients; i++) {
 			if (pfd[i].fd && !cinfo[i].client_fd
 			 && (now_ms - cinfo[i].started_ms) > CLIENT_TIMEOUT_MS
@@ -1745,7 +1768,7 @@ static void main_loop(void)
 		if (!cnt_closed)
 			continue;
 
-		/* we closed at least one client, coalesce pfd[], cinfo[] */
+		/* We closed at least one client, coalesce pfd[], cinfo[] */
 		if (min_closed + cnt_closed >= num_clients) {
 			/* clients [min_closed..num_clients-1] are all closed */
 			/* log(L_DEBUG, "taking shortcut"); - almost always happens */
@@ -1787,7 +1810,7 @@ static void main_loop(void)
 
 static smallint wrote_pidfile;
 
-static void signal_handler(int sig)
+static void cleanup_on_signal(int sig)
 {
 	if (wrote_pidfile)
 		unlink(NSCD_PIDFILE);
@@ -1931,7 +1954,7 @@ static void handle_chfiles(const char *str, int srv)
 	config.check_files[srv] = ((str[0] | 0x20) == 'y');
 }
 
-static void parse_conffile(const char *conffile)
+static void parse_conffile(const char *conffile, int warn)
 {
 	static const struct confword {
 		const char *str;
@@ -2000,7 +2023,8 @@ static void parse_conffile(const char *conffile)
 				if (word->str[0] == 'S') {
 					char *p2 = skip_service(&srv, p);
 					if (!p2) {
-						error("%s:%d: ignoring unknown service name '%s'", conffile, lineno, p);
+						if (warn)
+							error("%s:%d: ignoring unknown service name '%s'", conffile, lineno, p);
 						break;
 					}
 					p = p2;
@@ -2011,12 +2035,84 @@ static void parse_conffile(const char *conffile)
 			}
 			word++;
 			if (!word->str) {
-				error("%s:%d: ignoring unknown directive '%s'", conffile, lineno, p);
+				if (warn)
+					error("%s:%d: ignoring unknown directive '%s'", conffile, lineno, p);
 				break;
 			}
 		}
 	}
 	fclose(file);
+}
+
+
+/* "XX,XX[,XX]..." -> gid_t[] */
+static gid_t* env_U_to_uid_and_gids(const char *str, int *sizep)
+{
+	const char *sp;
+	gid_t *ug, *gp;
+	int ng;
+
+	sp = str;
+	ng = 1;
+	while (*sp)
+		if (*sp++ == ',')
+			ng++;
+	ug = xmalloc(ng * sizeof(ug[0]));
+
+	ng = 0;
+	gp = ug;
+	sp = str;
+	errno = 0;
+	while (1) {
+		ng++;
+		*gp++ = strtoul(sp, (char**)&sp, 16);
+		if (errno || (*sp != ',' && *sp != '\0'))
+			error_and_die("internal error");
+		if (*sp == '\0')
+			break;
+		sp++;
+	}
+
+	*sizep = ng;
+	return ug;
+}
+
+
+static char* user_to_env_U(const char *user)
+{
+	int ng;
+	char *ug_str, *sp;
+	gid_t *ug, *gp;
+	struct passwd *pw;
+
+	pw = getpwnam(user);
+	if (!pw)
+		perror_and_die("user '%s' is not known", user);
+
+	ng = 64;
+	/* 0th cell will be used for uid */
+	ug = xmalloc((1 + ng) * sizeof(ug[0]));
+	if (getgrouplist(user, pw->pw_gid, &ug[1], &ng) < 0) {
+		ug = xrealloc(ug, (1 + ng) * sizeof(ug[0]));
+		if (getgrouplist(user, pw->pw_gid, &ug[1], &ng) < 0)
+			perror_and_die("can't get groups of user '%s'", user);
+	}
+	ng++;
+	ug[0] = pw->pw_uid;
+
+	/* How much do we need for "-Uxx,xx[,xx]..." string? */
+	ug_str = xmalloc((sizeof(unsigned long)+1)*2 * ng + 3);
+	gp = ug;
+	sp = ug_str;
+	*sp++ = 'U';
+	*sp++ = '=';
+	do {
+		sp += sprintf(sp, "%lx,", (unsigned long)(*gp++));
+	} while (--ng);
+	sp[-1] = '\0';
+
+	free(ug);
+	return ug_str;
 }
 
 
@@ -2077,9 +2173,8 @@ void __nss_disable_nscd(void);
 int main(int argc, char **argv)
 {
 	int n;
+	const char *env_U;
 	const char *conffile;
-	uid_t config_uid;
-	uid_t config_gid;
 
 	/* make sure we don't get recursive calls */
 	__nss_disable_nscd();
@@ -2089,6 +2184,9 @@ int main(int argc, char **argv)
 
 	setlinebuf(stdout);
 	setlinebuf(stderr);
+
+	/* For idiotic kernels which disallow "exec /proc/self/exe" */
+	readlink_self_exe();
 
 	conffile = default_conffile;
 	while ((n = getopt_long(argc, argv, "df:i:KVgt:", longopt, NULL)) != -1) {
@@ -2122,7 +2220,33 @@ int main(int argc, char **argv)
 		}
 	}
 
-	parse_conffile(conffile);
+	env_U = getenv("U");
+	/* Avoid duplicate warnings if $U exists */
+	parse_conffile(conffile, /* warn? */ (env_U == NULL));
+
+	/* I have a user report of (broken?) ldap nss library
+	 * opening and never closing a socket to a ldap server,
+	 * even across fork() and exec(). This messes up
+	 * worker child's operations for the reporter.
+	 *
+	 * This strenghtens my belief that nscd _must not_ trust
+	 * nss libs to be written correctly.
+	 *
+	 * Here, we need to jump through the hoops to guard against
+	 * such problems. If config file has server-user setting, we need
+	 * to setgroups + setuid. For that, we need to get uid and gid vector.
+	 * And that means possibly using buggy nss libs.
+	 * We will do it here, but then we will re-exec, passing uid+gids
+	 * in an environment variable.
+	 */
+	if (!env_U && config.user) {
+		/* user_to_env_U() does getpwnam and getgrouplist */
+		if (putenv(user_to_env_U(config.user)))
+			error_and_die("out of memory");
+		/* fds leaked by nss will be closed by execed copy */
+		execv("/proc/self/exe", argv);
+		xexecve(self_exe_points_to, argv, environ);
+	}
 
 	/* Allocate dynamically sized stuff */
 	max_reqnum += 2; /* account for 2 first "fake" clients */
@@ -2145,21 +2269,23 @@ int main(int argc, char **argv)
 	n = xopen3("/dev/null", O_RDWR, 0);
 	while (n < 2)
 		n = dup(n);
-	/* Some environments (e.g. Midnight Commander) leave stray
-	 * open descriptors. Not trying to be thorough here,
-	 * just quick-and-dirty pass at closing such fds */
-	n |= 0xf; /* start from at least fd# 15 */
+	/* Close unexpected open file descriptors */
+	n |= 0xff; /* start from at least fd# 255 */
 	do {
 		close(n--);
 	} while (n > 2);
 
 	/* Register cleanup hooks */
-	signal(SIGINT, signal_handler);
-	signal(SIGTERM, signal_handler);
+	signal(SIGINT, cleanup_on_signal);
+	signal(SIGTERM, cleanup_on_signal);
 	/* Don't die if a client closes a socket on us */
 	signal(SIGPIPE, SIG_IGN);
 	/* Avoid creating zombies */
 	signal(SIGCHLD, SIG_IGN);
+#if !DEBUG_BUILD
+	/* Ensure workers don't have SIGALRM ignored */
+	signal(SIGALRM, SIG_DFL);
+#endif
 
 	mkdir(NSCD_DIR, 0777);
 	pfd[0].fd = open_socket(NSCD_SOCKET);
@@ -2167,15 +2293,6 @@ int main(int argc, char **argv)
 	pfd[0].events = POLLIN;
 	pfd[1].events = POLLIN;
 	
-	if (config.user) {
-		struct passwd *pw = getpwnam(config.user);
-		if (!pw)
-			perror_and_die("user '%s' is not known", config.user);
-		config_uid = pw->pw_uid;
-		config_gid = pw->pw_gid;
-		/* delay actual switch after opening log, writing pidfile etc */
-	}
-
 	if (debug & D_DAEMON) {
 		daemon(/*nochdir*/ 1, /*noclose*/ 0);
 		if (config.logfile) {
@@ -2194,20 +2311,29 @@ int main(int argc, char **argv)
 		signal(SIGTSTP, SIG_IGN);
 	}
 
-	/* For idiotic kernels which disallow "exec /proc/self/exe" */
-	readlink_self_exe();
-
-	if (config.user) {
-		if (initgroups(config.user, config_gid))
+	if (env_U) {
+		int size;
+		gid_t *ug = env_U_to_uid_and_gids(env_U, &size);
+		if (setgroups(size, &ug[1]))
 			perror_and_die("cannot set groups for user '%s'", config.user);
-		if (setuid(config_uid))
-			perror_and_die("cannot set uid to %u", (unsigned)config_uid);
+		if (setuid(ug[0]))
+			perror_and_die("cannot set uid to %u", (unsigned)(ug[0]));
+		free(ug);
 	}
 
 	log(L_ALL, "nscd v" PROGRAM_VERSION ", debug level %x", debug & L_ALL);
-	log(L_DEBUG, "passwd cache: %d pttl %u nttl %u", config.srv_enable[SRV_PASSWD], config.pttl[SRV_PASSWD], config.nttl[SRV_PASSWD]);
-	log(L_DEBUG, " group cache: %d pttl %u nttl %u", config.srv_enable[SRV_GROUP ], config.pttl[SRV_GROUP ], config.nttl[SRV_GROUP ]);
-	log(L_DEBUG, " hosts cache: %d pttl %u nttl %u", config.srv_enable[SRV_HOSTS ], config.pttl[SRV_HOSTS ], config.nttl[SRV_HOSTS ]);
+	log(L_DEBUG, "passwd cache: %d pttl %u nttl %u",
+				config.srv_enable[SRV_PASSWD],
+				config.pttl[SRV_PASSWD],
+				config.nttl[SRV_PASSWD]);
+	log(L_DEBUG, " group cache: %d pttl %u nttl %u",
+				config.srv_enable[SRV_GROUP ],
+				config.pttl[SRV_GROUP],
+				config.nttl[SRV_GROUP]);
+	log(L_DEBUG, " hosts cache: %d pttl %u nttl %u",
+				config.srv_enable[SRV_HOSTS ],
+				config.pttl[SRV_HOSTS],
+				config.nttl[SRV_HOSTS]);
 
 	for (n = 0; n < 3; n++) {
 		config.pttl[n] *= 1000;
