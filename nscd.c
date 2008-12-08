@@ -116,8 +116,9 @@ vda.linux@googlemail.com
  *      ("services" is a new service we don't support)
  * 0.34 create /var/run/nscd/nscd.pid pidfile like glibc nscd 2.8 does;
  *      delay setuid'ing itself to server-user after log and pidfile are open
+ * 0.35 readlink /proc/self/exe and use result if execing /proc/self/exe fails
  */
-#define PROGRAM_VERSION "0.34"
+#define PROGRAM_VERSION "0.35"
 
 #define DEBUG_BUILD 1
 
@@ -277,7 +278,7 @@ static void xexecve(const char *filename, char **argv, char **envp) NORETURN;
 static void xexecve(const char *filename, char **argv, char **envp)
 {
 	execve(filename, argv, envp);
-	perror_and_die("cannot re-exec");
+	perror_and_die("cannot re-exec %s", filename);
 }
 
 static void ndelay_on(int fd)
@@ -487,6 +488,7 @@ static struct {
 };
 
 static const char default_conffile[] = "/etc/nscd.conf";
+static const char *self_exe_points_to = "/proc/self/exe";
 
 
 /*
@@ -1219,7 +1221,8 @@ static int create_and_feed_worker(user_req *ureq)
 		/* Re-exec ourself, cleaning up all allocated memory.
 		 * fds in parent are marked CLOEXEC and will be closed too
 		 * (modulo bugs) */
-		xexecve("/proc/self/exe", (char**)argv, (char**)(argv+1));
+		execve("/proc/self/exe", (char**)argv, (char**)(argv+1));
+		xexecve(self_exe_points_to, (char**)argv, (char**)(argv+1));
 	}
 
 	/* parent */
@@ -1279,11 +1282,11 @@ static void worker(void)
 	user_req ureq;
 	void *resp;
 
+	worker_ureq = &ureq; /* for signal handler */
+
 	/* Make sure we won't hang, but rather die */
 	if (WORKER_TIMEOUT_SEC)
 		alarm(WORKER_TIMEOUT_SEC);
-
-	worker_ureq = &ureq; /* for signal handler */
 
 	/* NB: fds 0, 1 are in blocking mode */
 
@@ -1339,7 +1342,6 @@ static void worker(void)
 		xfull_write(1, resp, ((response_header*)resp)->version_or_size);
 	}
 	_exit(0);
-#undef ureq
 }
 
 
@@ -1513,7 +1515,7 @@ static void handle_worker_response(int i, unsigned now_ms)
 
 	/* schedule for writeout */
 	pfd[i].fd = cinfo[i].client_fd;
-	cinfo[i].client_fd = 0; /* no, we don't wait for worker rely anymore */
+	cinfo[i].client_fd = 0; /* no, we don't wait for worker reply anymore */
 	pfd[i].events = POLLOUT;
 	/* pfd[i].revents = 0; - not needed? */
 
@@ -2018,6 +2020,18 @@ static void parse_conffile(const char *conffile)
 }
 
 
+/* not static - don't inline me, compiler! */
+void readlink_self_exe(void)
+{
+	char buf[PATH_MAX + 1];
+	ssize_t sz = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+	if (sz < 0)
+		perror_and_die("readlink %s failed", "/proc/self/exe");
+	buf[sz] = 0;
+	self_exe_points_to = xstrdup(buf);
+}
+
+
 static void special_op(const char *arg) NORETURN;
 static void special_op(const char *arg)
 {
@@ -2179,6 +2193,9 @@ int main(int argc, char **argv)
 		signal(SIGTTIN, SIG_IGN);
 		signal(SIGTSTP, SIG_IGN);
 	}
+
+	/* For idiotic kernels which disallow "exec /proc/self/exe" */
+	readlink_self_exe();
 
 	if (config.user) {
 		if (initgroups(config.user, config_gid))
