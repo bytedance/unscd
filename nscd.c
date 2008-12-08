@@ -58,7 +58,7 @@ resource leaks and hangs in NSS libraries.
 
 It is also many times smaller.
 
-Currently (v0.33) it emulates glibc nscd pretty closely
+Currently (v0.34) it emulates glibc nscd pretty closely
 (handles same command line flags and config file), and is moderately tested.
 
 Please note that as of 2008-08 it is not in wide use (yet?).
@@ -113,9 +113,11 @@ vda.linux@googlemail.com
  * 0.32 fix nttl/size defaults; simpler check for worker child in main()
  * 0.33 tweak includes so that it builds on my new machine (64-bit userspace);
  *      do not die on unknown service name, just warn
- *      ("services" is a new service we don't support).
+ *      ("services" is a new service we don't support)
+ * 0.34 create /var/run/nscd/nscd.pid pidfile like glibc nscd 2.8 does;
+ *      delay setuid'ing itself to server-user after log and pidfile are open
  */
-#define PROGRAM_VERSION "0.33"
+#define PROGRAM_VERSION "0.34"
 
 #define DEBUG_BUILD 1
 
@@ -1776,7 +1778,7 @@ static void main_loop(void)
 ** Initialization
 */
 
-#define NSCD_PIDFILE    "/var/run/nscd.pid"
+#define NSCD_PIDFILE    "/var/run/nscd/nscd.pid"
 #define NSCD_DIR        "/var/run/nscd"
 #define NSCD_SOCKET     "/var/run/nscd/socket"
 #define NSCD_SOCKET_OLD "/var/run/.nscd_socket"
@@ -2062,6 +2064,8 @@ int main(int argc, char **argv)
 {
 	int n;
 	const char *conffile;
+	uid_t config_uid;
+	uid_t config_gid;
 
 	/* make sure we don't get recursive calls */
 	__nss_disable_nscd();
@@ -2150,16 +2154,12 @@ int main(int argc, char **argv)
 	pfd[1].events = POLLIN;
 	
 	if (config.user) {
-		uid_t uid;
 		struct passwd *pw = getpwnam(config.user);
-
 		if (!pw)
 			perror_and_die("user '%s' is not known", config.user);
-		uid = pw->pw_uid; /* in case initgroups trashes getpwnam buffer */
-		if (initgroups(config.user, pw->pw_gid))
-			perror_and_die("cannot set groups for user '%s'", config.user);
-		if (setuid(uid))
-			perror_and_die("cannot set uid to %u", (unsigned)uid);
+		config_uid = pw->pw_uid;
+		config_gid = pw->pw_gid;
+		/* delay actual switch after opening log, writing pidfile etc */
 	}
 
 	if (debug & D_DAEMON) {
@@ -2178,6 +2178,13 @@ int main(int argc, char **argv)
 		signal(SIGTTOU, SIG_IGN);
 		signal(SIGTTIN, SIG_IGN);
 		signal(SIGTSTP, SIG_IGN);
+	}
+
+	if (config.user) {
+		if (initgroups(config.user, config_gid))
+			perror_and_die("cannot set groups for user '%s'", config.user);
+		if (setuid(config_uid))
+			perror_and_die("cannot set uid to %u", (unsigned)config_uid);
 	}
 
 	log(L_ALL, "nscd v" PROGRAM_VERSION ", debug level %x", debug & L_ALL);
