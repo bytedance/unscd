@@ -4,26 +4,26 @@
 /* unscd is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; version 2 of the License.
- * 
+ *
  * unscd is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
- * 
+ *
  * You can download the GNU General Public License from the GNU website
  * at http://www.gnu.org/ or write to the Free Software Foundation, Inc.,
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA. */
 
 /*
- * Build instructions:
- * 
- * gcc -Os -o nscd nscd.c
- *
- * gcc -fomit-frame-pointer -Wl,--sort-section -Wl,alignment -Wl,--sort-common
- *       -Os -o nscd nscd.c
- *
- * Description:
- 
+Build instructions:
+
+gcc -Os -o nscd nscd.c
+
+gcc -fomit-frame-pointer -Wl,--sort-section -Wl,alignment -Wl,--sort-common
+      -Os -o nscd nscd.c
+
+Description:
+
 It is well known that nscd provided with glibc is buggy.
 
 This leads people to invent babysitters which restart crashed/hung nscd.
@@ -101,8 +101,9 @@ Currently (v0.31) it emulates glibc nscd pretty closely
  * 0.29 implemented invalidate and shutdown options
  * 0.30 fixed buglet (sizeof(ptr) != sizeof(array))
  * 0.31 reduced client_info by one member
+ * 0.32 fix nttl/size defaults; simpler check for worker child in main()
  */
-#define PROGRAM_VERSION "0.31"
+#define PROGRAM_VERSION "0.32"
 
 #define DEBUG_BUILD 1
 
@@ -468,7 +469,7 @@ static struct {
 	.pttl        = { 3600, 3600, 3600 },
 	.nttl        = { 20, 60, 20 },
 	/* huh, what is the default cache size in glibc nscd? */
-	.nttl        = { 256 * 8 / 3, 256 * 8 / 3, 256 * 8 / 3 },
+	.size        = { 256 * 8 / 3, 256 * 8 / 3, 256 * 8 / 3 },
 };
 
 static const char default_conffile[] = "/etc/nscd.conf";
@@ -1137,7 +1138,7 @@ static void age_cache(unsigned now_ms, int srv)
 	int i;
 	unsigned sv = cached_cnt;
 
-	log(L_DEBUG, "aging cache, srv %d, now %u", srv, now_ms);
+	log(L_DEBUG, "aging cache, srv:%d, now:%u", srv, now_ms);
 	if (srv == -1 || !now_ms)
 		aging_interval_ms = INT_MAX;
 	i = cache_size * 8;
@@ -1181,7 +1182,7 @@ static void age_cache(unsigned now_ms, int srv)
 /* Returns stdout fd of the worker, in blocking mode */
 static int create_and_feed_worker(user_req *ureq)
 {
-	static const char *const argv[] = { "nscd_worker", NULL };
+	static const char *const argv[] = { "worker_nscd", NULL };
 
 	pid_t pid;
 	struct {
@@ -1258,15 +1259,17 @@ static void worker_signal_handler(int sig)
 	_exit(0);
 }
 
+static void worker(void) NORETURN;
 static void worker(void)
 {
 	user_req ureq;
 	void *resp;
 
 	/* Make sure we won't hang, but rather die */
-	worker_ureq = &ureq; /* for signal handler */
 	if (WORKER_TIMEOUT_SEC)
 		alarm(WORKER_TIMEOUT_SEC);
+
+	worker_ureq = &ureq; /* for signal handler */
 
 	/* NB: fds 0, 1 are in blocking mode */
 
@@ -1682,7 +1685,7 @@ static void main_loop(void)
 #endif
 					if (cinfo[i].ureq->type == SHUTDOWN) {
 						log(L_INFO, "got shutdown request, exiting");
-						exit(0);
+						return; /* exits nscd */;
 					}
 					len = cinfo[i].ureq->key_len;
 					service = (char*)&cinfo[i].ureq + len;
@@ -1935,6 +1938,7 @@ static void parse_conffile(const char *conffile)
 		{ "S" "check-files"           , handle_chfiles  },
 		{ "S" "persistent"            , handle_null     }, /* ? */
 		{ "S" "shared"                , handle_null     }, /* ? */
+		{ "S" "auto-propagate"        , handle_null     }, /* ? */
 		{ }
 	};
 
@@ -2044,7 +2048,7 @@ int main(int argc, char **argv)
 	/* make sure we don't get recursive calls */
 	__nss_disable_nscd();
 
-	if (strcmp(argv[0], "nscd_worker") == 0)
+	if (argv[0][0] == 'w') /* "worker_nscd" */
 		worker();
 
 	setlinebuf(stdout);
