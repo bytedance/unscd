@@ -24,13 +24,12 @@ gcc -fomit-frame-pointer -Wl,--sort-section -Wl,alignment -Wl,--sort-common
 
 Description:
 
-It is well known that nscd provided with glibc is buggy.
-
-This leads people to invent babysitters which restart crashed/hung nscd.
-This is ugly.
+nscd problems are not exactly unheard of. Over the years, there were
+quite a bit of bugs in it. This leads people to invent babysitters
+which restart crashed/hung nscd. This is ugly.
 
 After looking at nscd source in glibc I arrived to the conclusion
-that it's flawed by design and cannot be fixed. Even if nscd's own
+that its desidn is contributing to this significantly. Even if nscd's
 code is 100.00% perfect and bug-free, it can still suffer from bugs
 in libraries it calls.
 
@@ -57,13 +56,21 @@ processes). Cache hits are handled by parent. Only cache misses
 start worker children. This design is immune against
 resource leaks and hangs in NSS libraries.
 
-It is also many times smaller than glibc one.
+It is also many times smaller.
 
-Currently (v0.31) it emulates glibc nscd pretty closely
+Currently (v0.33) it emulates glibc nscd pretty closely
 (handles same command line flags and config file), and is moderately tested.
+
+Please note that as of 2008-08 it is not in wide use (yet?).
+If you have trouble compiling it, see an incompatibility with
+"standard" one or experience hangs/crashes, please report it to
+vda.linux@googlemail.com
 
 ***********************************************************************/
 
+/* Make struct ucred appear in sys/socket.h */
+#define _GNU_SOURCE 1
+/* For all good things */
 #include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -86,8 +93,10 @@ Currently (v0.31) it emulates glibc nscd pretty closely
 #include <sys/stat.h>
 #include <sys/poll.h>
 #include <sys/un.h>
-
-#include <arpa/inet.h> /* inet_ntoa (for debug build only) */
+/* For INT_MAX */
+#include <limits.h>
+/* For inet_ntoa (for debug build only) */
+#include <arpa/inet.h>
 
 /*
  * 0.21 add SEGV reporting to worker
@@ -102,8 +111,11 @@ Currently (v0.31) it emulates glibc nscd pretty closely
  * 0.30 fixed buglet (sizeof(ptr) != sizeof(array))
  * 0.31 reduced client_info by one member
  * 0.32 fix nttl/size defaults; simpler check for worker child in main()
+ * 0.33 tweak includes so that it builds on my new machine (64-bit userspace);
+ *      do not die on unknown service name, just warn
+ *      ("services" is a new service we don't support).
  */
-#define PROGRAM_VERSION "0.32"
+#define PROGRAM_VERSION "0.33"
 
 #define DEBUG_BUILD 1
 
@@ -1860,8 +1872,9 @@ static char *skip_service(int *srv, const char *s)
 		*srv = SRV_GROUP;
 	} else if (strcmp("hosts", s) == 0) {
 		*srv = SRV_HOSTS;
-	} else
-		error_and_die("unknown service name '%s'", s);
+	} else {
+		return NULL;
+	}
 	return skip_whitespace(s + 6);
 }
 
@@ -1981,7 +1994,12 @@ static void parse_conffile(const char *conffile)
 				p = skip_whitespace(p + strlen(p) + 1);
 				*skip_non_whitespace(p) = '\0';
 				if (word->str[0] == 'S') {
-					p = skip_service(&srv, p);
+					char *p2 = skip_service(&srv, p);
+					if (!p2) {
+						error("%s:%d: ignoring unknown service name '%s'", conffile, lineno, p);
+						break;
+					}
+					p = p2;
 					*skip_non_whitespace(p) = '\0';
 				}
 				word->handler(p, srv);
