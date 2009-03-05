@@ -120,8 +120,11 @@ vda.linux@googlemail.com
  * 0.36 excercise extreme paranoia handling server-user option;
  *      a little bit more verbose logging:
  *      L_DEBUG2 log level added, use debug-level 7 to get it
+ * 0.37 users reported over-zealous "detected change in /etc/passwd",
+ *      apparently stat() returns random garbage in unused padding
+ *      on some systems. Made the check less paranoid.
  */
-#define PROGRAM_VERSION "0.36"
+#define PROGRAM_VERSION "0.37"
 
 #define DEBUG_BUILD 1
 
@@ -1364,26 +1367,29 @@ static void worker(void)
 ** Main loop
 */
 
-static const char check_filenames[][sizeof("/etc/passwd")] = {
+static const char checked_filenames[][sizeof("/etc/passwd")] = {
 	[SRV_PASSWD] = "/etc/passwd", /*  "/etc/shadow"? */
 	[SRV_GROUP]  = "/etc/group",
 	[SRV_HOSTS]  = "/etc/hosts", /* "/etc/resolv.conf" "/etc/nsswitch.conf"? */
 };
 
-static struct stat check_statbuf[sizeof(check_filenames) / sizeof(check_filenames[0])];
+static long checked_status[sizeof(checked_filenames) / sizeof(checked_filenames[0])];
 
 static void check_files(int srv)
 {
-	const char *file = check_filenames[srv];
-	struct stat *sb = &check_statbuf[srv];
-	struct stat tempbuf;
+	struct stat tsb;
+	const char *file = checked_filenames[srv];
+	long v;
 	
-	memset(&tempbuf, 0, sizeof(tempbuf));
-	stat(file, &tempbuf); /* ignore errors */
-	tempbuf.st_atime = 0; /* this is not a change */
-	if (memcmp(sb, &tempbuf, sizeof(tempbuf)) != 0) {
+	memset(&tsb, 0, sizeof(tsb));
+	stat(file, &tsb); /* ignore errors */
+	/* Comparing struct stat's was giving false positives.
+	 * Extracting only those fields which are interesting: */
+	v = (long)tsb.st_mtime ^ (long)tsb.st_size ^ (long)tsb.st_ino; /* ^ (long)tsb.st_dev ? */
+
+	if (v != checked_status[srv]) {
+		checked_status[srv] = v;
 		log(L_INFO, "detected change in %s", file);
-		memcpy(sb, &tempbuf, sizeof(tempbuf));
 		age_cache(0, srv); /* frees entire cache */
 	}
 }
@@ -1485,10 +1491,6 @@ static void handle_worker_response(int i, unsigned now_ms)
 	unsigned resp_sz;
 	unsigned ureq_sz_aligned = (char*)ureq_response(ureq) - (char*)ureq;
 
-	/* Replies can be big (getgrnam("guest") on a big user db),
-	 * we cannot rely on them being atomic. However, we know that worker
-	 * _always_ gives reply in one full_write(), so loop and read it all
-	 * (looping is implemented inside full_read()) */
 	resp_sz = full_read(pfd[i].fd, &sz_and_found, 8);
 	if (resp_sz != 8) {
 		/* worker was killed? */
@@ -1510,7 +1512,11 @@ static void handle_worker_response(int i, unsigned now_ms)
 	resp->found = sz_and_found.found;
 	if (sz_and_found.found) {
 		/* We need to read data only if it's found
-		 * (otherwise worker sends only 8 bytes) */
+		 * (otherwise worker sends only 8 bytes).
+		 * Replies can be big (getgrnam("guest") on a big user db),
+		 * we cannot rely on them being atomic. However, we know that worker
+		 * _always_ gives reply in one full_write(), so loop and read it all
+		 * (looping is implemented inside full_read()) */
 		if (full_read(pfd[i].fd, resp->body, resp_sz - 8) != resp_sz - 8) {
 			/* worker was killed? */
 			log(L_DEBUG, "worker gave short reply");
