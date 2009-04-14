@@ -123,8 +123,9 @@ vda.linux@googlemail.com
  * 0.37 users reported over-zealous "detected change in /etc/passwd",
  *      apparently stat() returns random garbage in unused padding
  *      on some systems. Made the check less paranoid.
+ * 0.38 log POLLHUP better
  */
-#define PROGRAM_VERSION "0.37"
+#define PROGRAM_VERSION "0.38"
 
 #define DEBUG_BUILD 1
 
@@ -1685,9 +1686,16 @@ static void main_loop(void)
 				goto write_out;
 			}
 
+			if (pfd[i].revents == POLLHUP) {
+				/* POLLHUP means we can't write to it anymore */
+				log(L_INFO, "client %u disappered (got POLLHUP)");
+				close_client(i);
+				continue;
+			}
+
 			/* All strange and unexpected cases */
 			if (pfd[i].revents != POLLIN) {
-				/* Not just "can read" - prolly POLLHUP too */
+				/* Not just "can read", but some other bits are there */
 				log(L_INFO, "client %u revents is strange:%x", i, pfd[i].revents);
 				close_client(i);
 				continue;
