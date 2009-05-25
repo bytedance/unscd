@@ -29,7 +29,7 @@ quite a bit of bugs in it. This leads people to invent babysitters
 which restart crashed/hung nscd. This is ugly.
 
 After looking at nscd source in glibc I arrived to the conclusion
-that its desidn is contributing to this significantly. Even if nscd's
+that its design is contributing to this significantly. Even if nscd's
 code is 100.00% perfect and bug-free, it can still suffer from bugs
 in libraries it calls.
 
@@ -42,7 +42,7 @@ or file descriptor leaks and other bugs.
 
 Since nscd is multithreaded program with single shared cache,
 any resource leak in any NSS library has cumulative effect.
-Even if an NSS library leaks a file descriptor 0.01% of the time,
+Even if a NSS library leaks a file descriptor 0.01% of the time,
 this will make nscd crash or hang after some time.
 
 Of course bugs in NSS .so modules should be fixed, but meanwhile
@@ -124,8 +124,10 @@ vda.linux@googlemail.com
  *      apparently stat() returns random garbage in unused padding
  *      on some systems. Made the check less paranoid.
  * 0.38 log POLLHUP better
+ * 0.39 log answers to client better, log getpwnam in the worker,
+ *      pass debug level value down to worker.
  */
-#define PROGRAM_VERSION "0.38"
+#define PROGRAM_VERSION "0.39"
 
 #define DEBUG_BUILD 1
 
@@ -1217,8 +1219,6 @@ static void age_cache(unsigned now_ms, int srv)
 /* Returns stdout fd of the worker, in blocking mode */
 static int create_and_feed_worker(user_req *ureq)
 {
-	static const char *const argv[] = { "worker_nscd", NULL };
-
 	pid_t pid;
 	struct {
 		int rd;
@@ -1233,15 +1233,22 @@ static int create_and_feed_worker(user_req *ureq)
 	if (pid < 0) /* error */
 		perror_and_die("vfork");
 	if (!pid) { /* child */
+		char param[16];
+		char *argv[3];
+
 		close(to_child.wr);
 		close(to_parent.rd);
 		xmovefd(to_child.rd, 0);
 		xmovefd(to_parent.wr, 1);
+		sprintf(param, "%u", debug);
+		argv[0] = (char*) "worker_nscd";
+		argv[1] = param;
+		argv[2] = NULL;
 		/* Re-exec ourself, cleaning up all allocated memory.
 		 * fds in parent are marked CLOEXEC and will be closed too
 		 * (modulo bugs) */
-		execve("/proc/self/exe", (char**)argv, (char**)(argv+1));
-		xexecve(self_exe_points_to, (char**)argv, (char**)(argv+1));
+		execve("/proc/self/exe", argv, argv+2);
+		xexecve(self_exe_points_to, argv, argv+2);
 	}
 
 	/* parent */
@@ -1295,11 +1302,13 @@ static void worker_signal_handler(int sig)
 	_exit(0);
 }
 
-static void worker(void) NORETURN;
-static void worker(void)
+static void worker(const char *param) NORETURN;
+static void worker(const char *param)
 {
 	user_req ureq;
 	void *resp;
+
+	debug = atoi(param);
 
 	worker_ureq = &ureq; /* for signal handler */
 
@@ -1336,7 +1345,11 @@ static void worker(void)
 			(ureq.type == GETHOSTBYADDR ? AF_INET : AF_INET6)
 		));
 	} else if (ureq.type == GETPWBYNAME) {
-		resp = marshal_passwd(getpwnam(ureq.reqbuf));
+		struct passwd *pw;
+		log(L_DEBUG2, "getpwnam('%s')", ureq.reqbuf);
+		pw = getpwnam(ureq.reqbuf);
+		log(L_DEBUG2, "getpwnam result:%p", pw);
+		resp = marshal_passwd(pw);
 	} else if (ureq.type == GETPWBYUID) {
 		resp = marshal_passwd(getpwuid(atoi(ureq.reqbuf)));
 	} else if (ureq.type == GETGRBYNAME) {
@@ -1492,6 +1505,8 @@ static void handle_worker_response(int i, unsigned now_ms)
 	unsigned resp_sz;
 	unsigned ureq_sz_aligned = (char*)ureq_response(ureq) - (char*)ureq;
 
+//TODO: optimization:
+//try to read more (say 1k). Many responses will fit in the very first read
 	resp_sz = full_read(pfd[i].fd, &sz_and_found, 8);
 	if (resp_sz != 8) {
 		/* worker was killed? */
@@ -1657,6 +1672,7 @@ static void main_loop(void)
 				if (r < 0 && errno == EAGAIN)
 					continue;
 				if (r <= 0) { /* client isn't there anymore */
+					log(L_DEBUG, "client %d is gone (write returned %d)", i, r);
  write_out_is_done:
 					free_refcounted_ureq(&cinfo[i].resptr);
 					close_client(i);
@@ -1672,6 +1688,7 @@ static void main_loop(void)
 					 * read(3, "www.google.com\0\0", 16) = 16
 					 * close(3) = 0
 					 */
+					log(L_DEBUG, "client %d: sent answer %u bytes", i, cinfo[i].respos);
 					goto write_out_is_done;
 				}
 			}
@@ -1928,7 +1945,7 @@ static void handle_logfile(const char *str, int srv)
 
 static void handle_debuglvl(const char *str, int srv)
 {
-	debug |= getnum(str);
+	debug |= (uint8_t) getnum(str);
 }
 
 static void handle_threads(const char *str, int srv)
@@ -2194,7 +2211,7 @@ int main(int argc, char **argv)
 	__nss_disable_nscd();
 
 	if (argv[0][0] == 'w') /* "worker_nscd" */
-		worker();
+		worker(argv[1]);
 
 	setlinebuf(stdout);
 	setlinebuf(stderr);
