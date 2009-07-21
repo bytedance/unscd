@@ -126,10 +126,11 @@ vda.linux@googlemail.com
  * 0.38 log POLLHUP better
  * 0.39 log answers to client better, log getpwnam in the worker,
  *      pass debug level value down to worker.
- * 0.40 fix handling of shutdown and invalidate requests;
- *      fix bug with answer written in several pieces
+ * 0.40   fix handling of shutdown and invalidate requests;
+ *        fix bug with answer written in several pieces
+ * 0.40.1 set hints.ai_socktype = SOCK_STREAM in GETAI request
  */
-#define PROGRAM_VERSION "0.40"
+#define PROGRAM_VERSION "0.40.1"
 
 #define DEBUG_BUILD 1
 
@@ -1004,7 +1005,9 @@ static ai_response_header *obtain_addrinfo(const char *hostname)
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_flags = AI_CANONNAME;
-	/* hints.ai_socktype = SOCK_STREAM; - can kill dups (one for each possible SOCK_xxx) */
+	/* kills dups (one for each possible SOCK_xxx) */
+	/* this matches glibc behavior */
+	hints.ai_socktype = SOCK_STREAM;
 	ai = NULL; /* on failure getaddrinfo may leave it as-is */
 	err = getaddrinfo(hostname, NULL, &hints, &ai);
 
