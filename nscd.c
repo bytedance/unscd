@@ -17,7 +17,7 @@
 /*
 Build instructions:
 
-gcc -Os -o nscd nscd.c
+gcc -Wall -Wunused-parameter -Os -o nscd nscd.c
 
 gcc -fomit-frame-pointer -Wl,--sort-section -Wl,alignment -Wl,--sort-common
       -Os -o nscd nscd.c
@@ -129,8 +129,10 @@ vda.linux@googlemail.com
  * 0.40   fix handling of shutdown and invalidate requests;
  *        fix bug with answer written in several pieces
  * 0.40.1 set hints.ai_socktype = SOCK_STREAM in GETAI request
+ * 0.41   eliminate double caching of two near-simultaneous identical requests -
+ *        EXPERIMENTAL
  */
-#define PROGRAM_VERSION "0.40.1"
+#define PROGRAM_VERSION "0.41"
 
 #define DEBUG_BUILD 1
 
@@ -482,6 +484,12 @@ enum {
 	SRV_HOSTS,
 };
 
+static const char srv_name[3][7] = {
+	"passwd",
+	"group",
+	"hosts"
+};
+
 static struct {
 	const char *logfile;
 	const char *user;
@@ -537,7 +545,7 @@ typedef struct user_req {
 			USER_REQ_STRUCT
 		};
 		struct { /* when stored in cache, overlaps .version */
-			unsigned refcount:8; /* actually, can be 1 or 0 only */
+			unsigned refcount:8;
 			/* (timestamp24 * 256) == timestamp in ms */
 			unsigned timestamp24:24;
 		};
@@ -621,12 +629,7 @@ static int unsupported_ureq_type(unsigned type)
 	return 0;
 }
 
-/* Possible reductions:
- * fd, bufidx - uint8_t
- * started_ms -> uint16_t started_s
- * ureq - eliminate (derivable from bufidx?)
- * cell - eliminate (derivable from resptr?)
- */
+
 typedef struct client_info {
 	/* if client_fd != 0, we are waiting for the reply from worker
 	 * on pfd[i].fd, and client_fd is saved client's fd
@@ -636,12 +639,12 @@ typedef struct client_info {
 	unsigned bufidx;        /* buffer# in global client_buf[] */
 	unsigned started_ms;
 	unsigned respos;        /* response */
-	//unsigned resp_sz;
 	user_req *resptr;       /* response */
+	user_req **cache_pp;    /* cache entry address */
 	user_req *ureq;         /* request (points to client_buf[x]) */
-	user_req **cell;        /* cache cell ptr */
 } client_info;
 
+static unsigned g_now_ms;
 static int min_closed = INT_MAX;
 static int cnt_closed = 0;
 static int num_clients = 2; /* two listening sockets are "clients" too */
@@ -649,25 +652,85 @@ static int num_clients = 2; /* two listening sockets are "clients" too */
 /* We read up to max_reqnum requests in parallel */
 static unsigned max_reqnum = 14;
 static int next_buf;
-/* Each of these points to [max_reqnum] sized array */
 static char          (*client_buf)[MAX_USER_REQ_SIZE];
 static char          *busy_cbuf;
 static struct pollfd *pfd;
 static client_info   *cinfo;
+
+/* Request, response and cache data structures:
+ *
+ * cache[] (defined later):
+ * cacheline_t cache[cache_size] array, or in other words,
+ * user_req* cache[cache_size][8] array.
+ * Every client request is hashed, hash value determines which cache[x]
+ * will have the response stored in one of its 8 elements.
+ * Cache entries have this format: request, then padding to 32 bits,
+ * then the response.
+ * Addresses in cache[x][y] may be NULL or:
+ * (&client_buf[z]) & 1: the cache miss is in progress ("future entry")
+ * (&client_buf[z]) & 3: the cache miss is in progress and other clients
+ * also want the same data ("shared future entry")
+ * else (non-NULL but low two bits are 0): cached data in malloc'ed block
+ *
+ * Each of these is a [max_reqnum] sized array:
+ * pfd[i] - given to poll() to wait for requests and replies.
+ *      .fd: first two pfd[i]: listening Unix domain sockets, else
+ *      .fd: open fd to a client, for reading client's request, or
+ *      .fd: open fd to a worker, to send request and get response back
+ * cinfo[i] - auxiliary client data for pfd[i]
+ *      .client_fd: open fd to a client, in case we already has read its
+ *          request and got a cache miss, and created a worker or
+ *          wait for another client's worker.
+ *          Otherwise, it's 0 and client's fd is in pfd[i].fd
+ *      .bufidx: index in client_buf[] we store client's request in
+ *      .bytecnt: size of the request
+ *      .started_ms: used to time out unresponsive clients
+ *      .respos:
+ *      .resptr:
+ *      .cache_pp: &cache[x][y] where the response is, or will be stored.
+ *      .ureq:
+ * When a client has received its reply (or otherwise closed (timeout etc)),
+ * corresponding pfd[i] and cinfo[i] are removed by shifting [i+1], [i+2] etc
+ * elements down, so that both arrays never have free holes.
+ * [num_clients] is always the first free element.
+ *
+ * Each of these also is a [max_reqnum] sized array, but indexes
+ * do not correspond directly to pfd[i] and cinfo[i]:
+ * client_buf[n][MAX_USER_REQ_SIZE] - buffers we read client requests into
+ * busy_cbuf[n] - bool flags marking busy client_buf[]
+ */
+/* Possible reductions:
+ * fd, bufidx - uint8_t
+ * started_ms -> uint16_t started_s
+ * ureq - eliminate (derivable from bufidx?)
+ */
+
+/* Are special bits 0? is it a true cached entry? */
+#define CACHED_ENTRY(p)     ( ((long)(p) & 3) == 0 )
+/* Are apecial bits 11? is it a shared future cache entry? */
+#define CACHE_SHARED(p)     ( ((long)(p) & 3) == 3 )
+/* Return a ptr with special bits cleared (used for accessing data) */
+#define CACHE_PTR(p)        ( (void*) ((long)(p) & ~(long)3) )
+/* Return a ptr with special bits set to x1: make future cache entry ptr */
+#define MAKE_FUTURE_PTR(p)  ( (void*) ((long)(p) | 1) )
+/* Modify ptr, set special bits to 11: shared future cache entry */
+#define MARK_PTR_SHARED(pp) ( *(long*)(pp) |= 3 )
 
 static inline unsigned ureq_size(const user_req *ureq)
 {
 	return sizeof(user_req_header) + ureq->key_len;
 }
 
-static unsigned cache_age(unsigned now_ms, const user_req *ureq)
+static unsigned cache_age(const user_req *ureq)
 {
-	return (uint32_t)now_ms - (ureq->timestamp24 << 8);
+	if (!CACHED_ENTRY(ureq))
+		return 0;
+	return (uint32_t) (g_now_ms - (ureq->timestamp24 << 8));
 }
 
-static void set_cache_timestamp(user_req *ureq, unsigned now_ms)
+static void set_cache_timestamp(user_req *ureq)
 {
-	ureq->timestamp24 = now_ms >> 8;
+	ureq->timestamp24 = g_now_ms >> 8;
 }
 
 static int alloc_buf_no(void)
@@ -689,11 +752,16 @@ static inline void *bufno2buf(int i)
 	return client_buf[i];
 }
 
-static void close_client(int i)
+static void close_client(unsigned i)
 {
-	log(L_DEBUG, "closing client %d (fd %d)", i, pfd[i].fd);
+	log(L_DEBUG, "closing client %u (fd %u,%u)", i, pfd[i].fd, cinfo[i].client_fd);
+	/* Paranoia. We had nasty bugs where client was closed twice. */
+	if (pfd[i].fd == 0) ////
+		return;
 	close(pfd[i].fd);
-	pfd[i].fd = 0; /* flag as unused */
+	if (cinfo[i].client_fd && cinfo[i].client_fd != pfd[i].fd)
+		close(cinfo[i].client_fd);
+	pfd[i].fd = 0; /* flag as unused (coalescing needs this) */
 	busy_cbuf[cinfo[i].bufidx] = 0;
 	cnt_closed++;
 	if (i < min_closed)
@@ -702,7 +770,7 @@ static void close_client(int i)
 
 
 /*
-** ncsd API <-> C API conversion
+** nscd API <-> C API conversion
 */
 
 typedef struct response_header {
@@ -1097,108 +1165,118 @@ static uint32_t bernstein_hash(void *p, unsigned sz, uint32_t hash)
 	return hash;
 }
 
-static user_req *find_cell_and_response(user_req ***cellp, user_req *ureq)
-{
-	user_req **cell;
-	unsigned hash;
-	unsigned i;
-	unsigned ureq_sz = ureq_size(ureq);
-
-	/* prevent overflow and division by zero */
-	if ((int)(cache_access_cnt+1) < 0) {
-		cache_access_cnt = (cache_access_cnt >> 1) + 1;
-		cache_hit_cnt = (cache_hit_cnt >> 1) + 1;
-	}
-	cache_access_cnt++;
-
-	hash = bernstein_hash(&ureq->key_len, ureq_sz - offsetof(user_req, key_len), ureq->type);
-	log(L_DEBUG, "hash:%08x", hash);
-	hash = hash % cache_size;
-	(*cellp) = cell = cache[hash];
-
-	for (i = 0; i < 8; i++) {
-		if (!cell[i])
-			continue;
-// TODO: do secondary hash match
-		/* ureq->version is always 2 and is reused in cache
-		 * for other purposes, we need to skip it here */
-		if (memcmp(&ureq->type, &cell[i]->type, ureq_sz - offsetof(user_req, type)) == 0) {
-			log(L_DEBUG, "found in cache[%u][%u]", hash, i);
-			cache_hit_cnt++;
-			return cell[i];
-		}
-	}
-	log(L_DEBUG, "not found in cache[%u][x]", hash);
-	return NULL;
-}
-
 static void free_refcounted_ureq(user_req **ureqp)
 {
 	user_req *ureq = *ureqp;
-	/* is it in use? */
+
+	if (!CACHED_ENTRY(ureq))
+		return;
+
 	if (ureq->refcount) {
-		ureq->refcount = 0; /* since it can be only 1 or 0... */
+		ureq->refcount--;
 	} else {
+		log(L_DEBUG2, "refcount == 0, free(%p)", ureq);
 		free(ureq);
 	}
 	*ureqp = NULL;
 }
 
-static void save_in_cell(user_req **cell, user_req *new_cached, unsigned now_ms)
+static user_req **lookup_in_cache(user_req *ureq)
 {
+	user_req **cacheline;
+	int free_cache;
+	unsigned hash;
+	unsigned i;
+	unsigned ureq_sz = ureq_size(ureq);
+
+	/* prevent overflow and division by zero */
+	cache_access_cnt++;
+	if ((int)cache_access_cnt < 0) {
+		cache_access_cnt = (cache_access_cnt >> 1) + 1;
+		cache_hit_cnt = (cache_hit_cnt >> 1) + 1;
+	}
+
+	hash = bernstein_hash(&ureq->key_len, ureq_sz - offsetof(user_req, key_len), ureq->type);
+	log(L_DEBUG2, "hash:%08x", hash);
+	hash = hash % cache_size;
+	cacheline = cache[hash];
+
+	free_cache = -1;
+	for (i = 0; i < 8; i++) {
+		user_req *cached = CACHE_PTR(cacheline[i]);
+		if (!cached) {
+			if (free_cache == -1)
+				free_cache = i;
+			continue;
+		}
+		/* ureq->version is always 2 and is reused in cache
+		 * for other purposes, we need to skip it here */
+		if (memcmp(&ureq->type, &cached->type, ureq_sz - offsetof(user_req, type)) == 0) {
+			log(L_DEBUG, "found in cache[%u][%u]", hash, i);
+			cache_hit_cnt++;
+			return &cacheline[i];
+		}
+	}
+
+	if (free_cache >= 0) {
+		cached_cnt++;
+		i = free_cache;
+		log(L_DEBUG, "not found, using free cache[%u][%u]", hash, i);
+		goto ret;
+	}
+
 	unsigned oldest_idx = 0;
 	unsigned oldest_age = 0;
-	unsigned age;
-	unsigned i;
-
 	for (i = 0; i < 8; i++) {
-		if (!cell[i]) {
-			log(L_DEBUG, "using free cache[x][%u]", i);
-			cached_cnt++;
-			cell[i] = new_cached;
-			aging_interval_ms = min_aging_interval_ms;
-			return;
-		}
-		age = cache_age(now_ms, cell[i]);
+		unsigned age = cache_age(cacheline[i]);
 		if (age > oldest_age) {
 			oldest_age = age;
 			oldest_idx = i;
 		}
 	}
-	log(L_DEBUG, "freeing and reusing cache[x][%u] (age %u)", oldest_idx, oldest_age);
-	if (cell[oldest_idx]) {
-		free_refcounted_ureq(&cell[oldest_idx]);
-	} else {
-		cached_cnt++;
+	if (oldest_age == 0) {
+		/* All entries in cacheline are "future" entries!
+		 * This is very unlikely, but we must still work correctly.
+		 * We call this "fake cache entry".
+		 * The data will be "cached" only for the duration
+		 * of this client's request lifetime.
+		 */
+		log(L_DEBUG, "not found, and cache[%u] is full: using fake cache entry", hash);
+		return NULL;
 	}
-	cell[oldest_idx] = new_cached;
-	aging_interval_ms = min_aging_interval_ms;
+	i = oldest_idx;
+	log(L_DEBUG, "not found, freeing and reusing cache[%u][%u] (age %u)", hash, i, oldest_age);
+	free_refcounted_ureq(&cacheline[i]);
+
+ ret:
+	cacheline[i] = MAKE_FUTURE_PTR(ureq);
+	return &cacheline[i];
 }
 
-static void age_cache(unsigned now_ms, int srv)
+static void age_cache(unsigned free_all, int srv)
 {
 	user_req **cp = *cache;
 	int i;
 	unsigned sv = cached_cnt;
 
-	log(L_DEBUG, "aging cache, srv:%d, now:%u", srv, now_ms);
-	if (srv == -1 || !now_ms)
+	log(L_DEBUG, "aging cache, srv:%d, free_all:%u", srv, free_all);
+	if (srv == -1 || free_all)
 		aging_interval_ms = INT_MAX;
 	i = cache_size * 8;
 	do {
 		user_req *cached = *cp;
-		if (cached) {
+		if (CACHED_ENTRY(cached) && cached != NULL) {
 			int csrv = type_to_srv[cached->type];
 			if (srv == -1 || srv == csrv) {
-				if (!now_ms) {
+				if (free_all) {
 					cached_cnt--;
 					free_refcounted_ureq(cp);
 				} else {
-                        		unsigned age = cache_age(now_ms, cached);
+                        		unsigned age = cache_age(cached);
 					response_header *resp = ureq_response(cached);
 					unsigned ttl = (resp->found ? config.pttl : config.nttl)[csrv];
 					if (age >= ttl) {
-						log(L_DEBUG, "freeing: age %u positive %d ttl %u", age, resp->found, ttl);
+						log(L_DEBUG2, "freeing: age %u positive %d ttl %u", age, resp->found, ttl);
 						cached_cnt--;
 						free_refcounted_ureq(cp);
 					} else if (srv == -1) {
@@ -1212,8 +1290,7 @@ static void age_cache(unsigned now_ms, int srv)
 		cp++;
 	} while (--i);
 	log(L_INFO, "aged cache, freed:%u, remain:%u", sv - cached_cnt, cached_cnt);
-	if (srv == -1 || !now_ms)
-		log(L_DEBUG, "aging interval now %u ms", aging_interval_ms);
+	log(L_DEBUG2, "aging interval now %u ms", aging_interval_ms);
 }
 
 
@@ -1239,7 +1316,7 @@ static int create_and_feed_worker(user_req *ureq)
 	if (pid < 0) /* error */
 		perror_and_die("vfork");
 	if (!pid) { /* child */
-		char param[16];
+		char param[sizeof(int)*3 + 2];
 		char *argv[3];
 
 		close(to_child.wr);
@@ -1267,6 +1344,7 @@ static int create_and_feed_worker(user_req *ureq)
 	xsafe_write(to_child.wr, ureq, ureq_size(ureq));
 
 	close(to_child.wr);
+	close_on_exec(to_parent.rd);
 	return to_parent.rd;
 }
 
@@ -1400,7 +1478,7 @@ static void check_files(int srv)
 	struct stat tsb;
 	const char *file = checked_filenames[srv];
 	long v;
-	
+
 	memset(&tsb, 0, sizeof(tsb));
 	stat(file, &tsb); /* ignore errors */
 	/* Comparing struct stat's was giving false positives.
@@ -1410,7 +1488,7 @@ static void check_files(int srv)
 	if (v != checked_status[srv]) {
 		checked_status[srv] = v;
 		log(L_INFO, "detected change in %s", file);
-		age_cache(0, srv); /* frees entire cache */
+		age_cache(/*free_all:*/ 1, srv);
 	}
 }
 
@@ -1419,13 +1497,12 @@ static int handle_client(int i)
 {
 	int srv;
 	user_req *ureq = cinfo[i].ureq;
-	user_req **cell;
+	user_req **cache_pp;
 	user_req *ureq_and_resp;
 
 	log(L_DEBUG, "version:%d type:%d(%s) key_len:%d '%s'",
 			ureq->version, ureq->type, typestr[ureq->type],
 			ureq->key_len, req_str(ureq->type, ureq->reqbuf));
-	hex_dump(cinfo[i].ureq, cinfo[i].bytecnt);
 
 	if (ureq->version != NSCD_VERSION) {
 		log(L_INFO, "wrong version");
@@ -1448,9 +1525,10 @@ static int handle_client(int i)
 		return 0;
 	}
 	if (unsupported_ureq_type(ureq->type)) {
-		/* We don't know this request. Just close the connection */
-		/* (glibc client interprets this like "not supported by this nscd") */
-		log(L_INFO, "unsupported query, dropping");
+		/* We don't know this request. Just close the connection.
+		 * (glibc client interprets this like "not supported by this nscd")
+		 * Happens very often, thus DEBUG, not INFO */
+		log(L_DEBUG, "unsupported query, dropping");
 		close_client(i);
 		return 0;
 	}
@@ -1460,6 +1538,8 @@ static int handle_client(int i)
 		close_client(i);
 		return 0;
 	}
+
+	hex_dump(cinfo[i].ureq, cinfo[i].bytecnt);
 
 	if (ureq->type == SHUTDOWN
 	 || ureq->type == INVALIDATE
@@ -1489,7 +1569,7 @@ static int handle_client(int i)
 		}
 		log(L_INFO, "got invalidate request, flushing cache");
 		/* Frees entire cache. TODO: replace -1 with service (in ureq->reqbuf) */
-		age_cache(0, -1);
+		age_cache(/*free_all:*/ 1, -1);
 		close_client(i);
 		return 0;
 	}
@@ -1508,106 +1588,168 @@ static int handle_client(int i)
 		check_files(srv);
 	}
 
-	/* If in cache, save ptr to response into cinfo and return */
-	ureq_and_resp = find_cell_and_response(&cell, ureq);
+	cache_pp = lookup_in_cache(ureq);
+	ureq_and_resp = cache_pp ? *cache_pp : NULL;
+
 	if (ureq_and_resp) {
-		response_header *resp = ureq_response(ureq_and_resp);
-		unsigned sz = resp->version_or_size;
-		log(L_DEBUG, "sz:%u", sz);
-		hex_dump(resp, sz);
-		ureq_and_resp->refcount = 1; /* cache shouldn't free it under us! */
-		pfd[i].events = POLLOUT; /* we want to write out */
-		cinfo[i].resptr = ureq_and_resp;
-		cinfo[i].respos = 0;
-		//cinfo[i].resp_sz = sz;
-		return 1;
+		if (CACHED_ENTRY(ureq_and_resp)) {
+			/* Found. Save ptr to response into cinfo and return */
+			response_header *resp = ureq_response(ureq_and_resp);
+			unsigned sz = resp->version_or_size;
+
+			log(L_DEBUG, "sz:%u", sz);
+			hex_dump(resp, sz);
+			ureq_and_resp->refcount++; /* cache shouldn't free it under us! */
+			pfd[i].events = POLLOUT; /* we want to write out */
+			cinfo[i].resptr = ureq_and_resp;
+			/*cinfo[i].respos = 0; - already is */
+			/* prevent future matches with anything */
+			cinfo[i].cache_pp = (void *) 1;
+			return 1; /* "ready to write data out to client" */
+		}
+
+		/* Not found. Remember a pointer where it will appear */
+		cinfo[i].cache_pp = cache_pp;
+
+		if (CACHE_PTR(ureq_and_resp) != ureq) {
+			/* We are not the first client who wants this */
+			log(L_DEBUG, "another request is in progress (%p), waiting for its result", ureq_and_resp);
+			MARK_PTR_SHARED(cache_pp); /* "please inform us when it's ready" */
+			/* "we do not wait for client anymore" */
+			cinfo[i].client_fd = pfd[i].fd;
+			/* Don't wait on fd. Worker response will unblock us */
+			pfd[i].events = 0;
+			return 0;
+		}
+		/* else: lookup_in_cache inserted (ureq & 1) into *cache_pp:
+		 * we are the first client to miss on this ureq. */
 	}
 
 	/* Start worker thread */
-	cinfo[i].cell = cell;
+	log(L_DEBUG, "stored %p in cache, starting a worker", ureq_and_resp);
 	/* Now we will wait on worker's fd, not client's! */
 	cinfo[i].client_fd = pfd[i].fd;
 	pfd[i].fd = create_and_feed_worker(ureq);
-
-/* We can do it here, but we don't really need to.
- * We need to have client_buf[] big enough anyway for worst case scenario,
- * so we can simply keep cbuf allocated until we close a client.
-	cinfo[i].ureq = NULL;
-	busy_cbuf[cinfo[i].bufidx] = 0;
- */
+log(L_DEBUG, "A pfd[%d].fd=%d", i, pfd[i].fd);
 	return 0;
 }
 
-/* When we return, reply is fully read and stored in cache,
- * worker's fd is closed, pfd[i] and cinfo[i] are updated. */
-static void handle_worker_response(int i, unsigned now_ms)
+static void prepare_for_writeout(unsigned i, user_req *cached)
 {
-	response_header sz_and_found;
-	user_req *cached;
-	user_req *ureq = cinfo[i].ureq;
-	response_header *resp;
-	unsigned resp_sz;
-	unsigned ureq_sz_aligned = (char*)ureq_response(ureq) - (char*)ureq;
+	log(L_DEBUG2, "client %u: data is ready at %p", i, cached);
 
-//TODO: optimization:
-//try to read more (say 1k). Many responses will fit in the very first read
-	resp_sz = full_read(pfd[i].fd, &sz_and_found, 8);
-	if (resp_sz != 8) {
+	if (cinfo[i].client_fd) {
+		pfd[i].fd = cinfo[i].client_fd;
+log(L_DEBUG, "B pfd[%d].fd=%d", i, pfd[i].fd);
+		cinfo[i].client_fd = 0; /* "we don't wait for worker reply" */
+	}
+	pfd[i].events = POLLOUT;
+
+	/* Writeout position etc */
+	cinfo[i].resptr = cached;
+	/*cinfo[i].respos = 0; - already is */
+	/* if worker took some time to get info (e.g. DNS query),
+	 * prevent client timeout from triggering at once */
+	cinfo[i].started_ms = g_now_ms;
+}
+
+/* Worker seems to be ready to write the response.
+ * When we return, response is fully read and stored in cache,
+ * worker's fd is closed, pfd[i] and cinfo[i] are updated. */
+static void handle_worker_response(int i)
+{
+	struct { /* struct response_header + small body */
+		uint32_t version_or_size;
+		int32_t found;
+		char body[256 - 8];
+	} sz_and_found;
+	user_req *cached;
+	user_req *ureq;
+	response_header *resp;
+	unsigned sz, resp_sz;
+	unsigned ureq_sz_aligned;
+
+	cached = NULL;
+	ureq = cinfo[i].ureq;
+	ureq_sz_aligned = (char*)ureq_response(ureq) - (char*)ureq;
+
+	sz = full_read(pfd[i].fd, &sz_and_found, sizeof(sz_and_found));
+	if (sz < 8) {
 		/* worker was killed? */
-		log(L_DEBUG, "worker gave short reply:%u != 8", resp_sz);
+		log(L_DEBUG, "worker gave short reply:%u < 8", sz);
 		goto err;
 	}
 
 	resp_sz = sz_and_found.version_or_size;
-	if (resp_sz < 8 || resp_sz > 0xfffffff) { /* 256 mb */
+	if (resp_sz < sz || resp_sz > 0xfffffff) { /* 256 mb */
 		error("BUG: bad size from worker:%u", resp_sz);
 		goto err;
 	}
 
 	/* Create new block of cached info */
 	cached = xzalloc(ureq_sz_aligned + resp_sz);
-	resp = (void*) ((char*)cached + ureq_sz_aligned);
+	log(L_DEBUG2, "xzalloc(%u):%p", ureq_sz_aligned + resp_sz, cached);
+	resp = (void*) (((char*) cached) + ureq_sz_aligned);
 	memcpy(cached, ureq, ureq_size(ureq));
-	resp->version_or_size = resp_sz;
-	resp->found = sz_and_found.found;
-	if (sz_and_found.found) {
+	memcpy(resp, &sz_and_found, sz);
+	if (sz_and_found.found && resp_sz > sz) {
 		/* We need to read data only if it's found
 		 * (otherwise worker sends only 8 bytes).
+		 *
 		 * Replies can be big (getgrnam("guest") on a big user db),
-		 * we cannot rely on them being atomic. However, we know that worker
-		 * _always_ gives reply in one full_write(), so loop and read it all
-		 * (looping is implemented inside full_read()) */
-		if (full_read(pfd[i].fd, resp->body, resp_sz - 8) != resp_sz - 8) {
+		 * we cannot rely on them being atomic. However, we know
+		 * that worker _always_ gives reply in one full_write(),
+		 * so we loop and read it all
+		 * (looping is implemented inside full_read())
+		 */
+		if (full_read(pfd[i].fd, ((char*) resp) + sz, resp_sz - sz) != resp_sz - sz) {
 			/* worker was killed? */
-			log(L_DEBUG, "worker gave short reply");
-			free(cached);
+			log(L_DEBUG, "worker gave short reply, free(%p)", cached);
  err:
+			free(cached);
 			cached = NULL;
 			goto wo;
 		}
 	}
+	set_cache_timestamp(cached);
 	hex_dump(resp, resp_sz);
-	/* save in cache */
-	cached->refcount = 1; /* cache shouldn't free it under us! */
-	set_cache_timestamp(cached, now_ms);
-	save_in_cell(cinfo[i].cell, cached, now_ms);
 
  wo:
 	close(pfd[i].fd);
 
-	/* schedule for writeout */
-	pfd[i].fd = cinfo[i].client_fd;
-	cinfo[i].client_fd = 0; /* no, we don't wait for worker reply anymore */
-	pfd[i].events = POLLOUT;
-	/* pfd[i].revents = 0; - not needed? */
+	/* Save in cache */
+	unsigned ref = 0;
+	user_req **cache_pp = cinfo[i].cache_pp;
+	if (cache_pp != NULL) { /* if not a fake entry */
+		ureq = *cache_pp;
+		*cache_pp = cached;
+		if (CACHE_SHARED(ureq)) {
+			/* Other clients wait for this response too,
+			 * wake them (and us) up and set refcount = no_of_clients */
+			unsigned j;
 
-	/* writeout position etc */
-	cinfo[i].resptr = cached;
-	cinfo[i].respos = 0;
-	//cinfo[i].resp_sz = resp_sz;
-	/* if worker took some time to get info (e.g. DNS query),
-	 * prevent client timeout from triggering at once */
-	cinfo[i].started_ms = now_ms;
+			for (j = 2; j < num_clients; j++) {
+				if (cinfo[j].cache_pp == cache_pp) {
+					/* This client uses the same cache entry */
+					ref++;
+					/* prevent future matches with anything */
+					cinfo[j].cache_pp = (void *) 1;
+					prepare_for_writeout(j, cached);
+				}
+			}
+			goto ret;
+		}
+		/* prevent future matches with anything */
+		cinfo[i].cache_pp = (void *) 1;
+		ref = 1;
+	}
+
+	prepare_for_writeout(i, cached);
+ret:
+	/* cache shouldn't free it under us! */
+	if (cached)
+		cached->refcount = ref;
+	aging_interval_ms = min_aging_interval_ms;
 }
 
 static void main_loop(void)
@@ -1622,26 +1764,33 @@ static void main_loop(void)
 	while (1) {
 		int i, j;
 		int r;
-		unsigned now_ms;
 
 		r = SMALL_POLL_TIMEOUT_MS;
 		if (num_clients <= 2 && !cached_cnt)
 			r = -1; /* infinite */
 		else if (num_clients < max_reqnum)
 			r = aging_interval_ms;
-
-#if 0 /* Debug: leak detector */
+// 0.41 is experimental, turning on:
+#if 1 /* Debug: leak detector */
 		{
 			static unsigned long long cnt;
-			void *p = malloc(240); /* should not be too small */
+			static unsigned long low_malloc = -1L;
+			static unsigned long low_sbrk = -1L;
+			void *p = malloc(540); /* should not be too small */
 			void *s = sbrk(0);
 			free(p);
-			log(L_INFO, "entering poll %llu (%d ms). num_clients:%u cached:%u %u/%u next malloc:%p, sbrk:%p",
-				cnt, r, num_clients, cached_cnt, cache_hit_cnt, cache_access_cnt, p, s);
+			if ((unsigned long)p < low_malloc)
+				low_malloc = (unsigned long)p;
+			if ((unsigned long)s < low_sbrk)
+				low_sbrk = (unsigned long)s;
+			log(L_INFO, "poll %llu (%d ms). clients:%u cached:%u %u/%u malloc:%p (%lu), sbrk:%p (%lu)",
+				cnt, r, num_clients, cached_cnt, cache_hit_cnt, cache_access_cnt,
+				p, (unsigned long)p - low_malloc,
+				s, (unsigned long)s - low_sbrk);
 			cnt++;
 		}
 #else
-		log(L_DEBUG, "entering poll (%d ms). num_clients:%u cached:%u hit_ratio:%u/%u",
+		log(L_DEBUG, "poll (%d ms). clients:%u cached:%u hit ratio:%u/%u",
 				r, num_clients, cached_cnt, cache_hit_cnt, cache_access_cnt);
 #endif
 
@@ -1657,7 +1806,7 @@ static void main_loop(void)
 		 * There is no blocking I/O (except when we talk to worker thread
 		 * which is guaranteed to not block us for long) */
 
-		now_ms = monotonic_ms();
+		g_now_ms = monotonic_ms();
 		if (r == 0)
 			goto skip_fd_checks;
 
@@ -1669,19 +1818,23 @@ static void main_loop(void)
 			cfd = accept(pfd[i].fd, NULL, NULL);
 			if (cfd < 0) {
 				/* odd... poll() says we can accept but accept failed? */
+if (pfd[i].fd < 3 || pfd[i].fd > 4)
+ perror_and_die("bad listening fd[%d]:%d", i, pfd[i].fd);
 				log(L_DEBUG2, "accept failed with %s", strerror(errno));
 				continue;
 			}
 			ndelay_on(cfd);
 			close_on_exec(cfd);
 			/* x[num_clients] is next free element, taking it */
+			log(L_DEBUG2, "new client %d, fd %d", num_clients, cfd);
 			pfd[num_clients].fd = cfd;
+log(L_DEBUG, "C pfd[%d].fd=%d", num_clients, pfd[num_clients].fd);
 			pfd[num_clients].events = POLLIN;
 			/* this will make us do read() in next for() loop: */
 			pfd[num_clients].revents = POLLIN;
 			memset(&cinfo[num_clients], 0, sizeof(cinfo[num_clients]));
 			/* cinfo[num_clients].bytecnt = 0; - done */
-			cinfo[num_clients].started_ms = now_ms;
+			cinfo[num_clients].started_ms = g_now_ms;
 			cinfo[num_clients].bufidx = alloc_buf_no();
 			cinfo[num_clients].ureq = bufno2buf(cinfo[num_clients].bufidx);
 			num_clients++;
@@ -1718,11 +1871,16 @@ static void main_loop(void)
 				if (r <= 0) { /* client isn't there anymore */
 					log(L_DEBUG, "client %d is gone (write returned %d)", i, r);
  write_out_is_done:
-					/* Most of the time, it is not freed here,
-					 * only refcounted--. Freeing happens
-					 * if it was deleted from cache[] but retained
-					 * for writeout. */
-					free_refcounted_ureq(&cinfo[i].resptr);
+					if (cinfo[i].cache_pp == NULL) {
+						log(L_DEBUG, "client %d: freeing fake cache entry %p", i, cinfo[i].resptr);
+						free(cinfo[i].resptr);
+					} else {
+						/* Most of the time, it is not freed here,
+						 * only refcounted--. Freeing happens
+						 * if it was deleted from cache[] but retained
+						 * for writeout. */
+						free_refcounted_ureq(&cinfo[i].resptr);
+					}
 					close_client(i);
 					continue;
 				}
@@ -1736,7 +1894,7 @@ static void main_loop(void)
 					 * read(3, "www.google.com\0\0", 16) = 16
 					 * close(3) = 0
 					 */
-					log(L_DEBUG, "client %d: sent answer %u bytes", i, cinfo[i].respos);
+					log(L_DEBUG, "client %u: sent answer %u bytes", i, cinfo[i].respos);
 					goto write_out_is_done;
 				}
 			}
@@ -1745,7 +1903,7 @@ static void main_loop(void)
 			 * already dead, revents may contain other bits too */
 			if ((pfd[i].revents & POLLIN) && cinfo[i].client_fd) {
 				log(L_DEBUG, "reading response for client %u", i);
-				handle_worker_response(i, now_ms);
+				handle_worker_response(i);
 				/* We can immediately try to write a response
 				 * to client */
 				goto write_out;
@@ -1753,7 +1911,7 @@ static void main_loop(void)
 
 			if (pfd[i].revents == POLLHUP) {
 				/* POLLHUP means we can't write to it anymore */
-				log(L_INFO, "client %u disappered (got POLLHUP)");
+				log(L_INFO, "client %u disappered (got POLLHUP)", i);
 				close_client(i);
 				continue;
 			}
@@ -1791,17 +1949,19 @@ static void main_loop(void)
 
  skip_fd_checks:
 		/* Age cache */
-		if ((now_ms - last_age_time) >= aging_interval_ms) {
-			last_age_time = now_ms;
-			age_cache(now_ms, -1);
+		if ((g_now_ms - last_age_time) >= aging_interval_ms) {
+			last_age_time = g_now_ms;
+			age_cache(/*free_all:*/ 0, -1);
 		}
 
 		/* Close timed out client connections */
 		for (i = 2; i < num_clients; i++) {
-			if (pfd[i].fd && !cinfo[i].client_fd
-			 && (now_ms - cinfo[i].started_ms) > CLIENT_TIMEOUT_MS
+			if (pfd[i].fd != 0 /* not closed yet? */ ////
+			 && cinfo[i].client_fd == 0 /* do we still wait for client, not worker? */
+			 && (g_now_ms - cinfo[i].started_ms) > CLIENT_TIMEOUT_MS
 			) {
-				log(L_INFO, "timed out waiting for client %u, dropping", i);
+				log(L_INFO, "timed out waiting for client %u (%u ms), dropping",
+					i, (unsigned)(g_now_ms - cinfo[i].started_ms));
 				close_client(i);
 			}
 		}
@@ -1830,7 +1990,7 @@ static void main_loop(void)
 
  coalesce_done:
 		num_clients -= cnt_closed;
-		log(L_DEBUG, "removing %d closed clients. num_clients:%d", cnt_closed, num_clients);
+		log(L_DEBUG, "removing %d closed clients. clients:%d", cnt_closed, num_clients);
 		min_closed = INT_MAX;
 		cnt_closed = 0;
 		/* start accepting new connects */
@@ -2058,7 +2218,7 @@ static void parse_conffile(const char *conffile, int warn)
 		word = conf_words;
 		while (1) {
 			if (strcmp(word->str + 1, p) == 0) {
-				int srv;
+				int srv = 0;
 				p = skip_whitespace(p + strlen(p) + 1);
 				*skip_non_whitespace(p) = '\0';
 				if (word->str[0] == 'S') {
@@ -2225,6 +2385,16 @@ int main(int argc, char **argv)
 	setlinebuf(stdout);
 	setlinebuf(stderr);
 
+	/* Make sure stdio is not closed */
+	n = xopen3("/dev/null", O_RDWR, 0);
+	while (n < 2)
+		n = dup(n);
+	/* Close unexpected open file descriptors */
+	n |= 0xff; /* start from at least fd# 255 */
+	do {
+		close(n--);
+	} while (n > 2);
+
 	/* For idiotic kernels which disallow "exec /proc/self/exe" */
 	readlink_self_exe();
 
@@ -2291,29 +2461,19 @@ int main(int argc, char **argv)
 	/* Allocate dynamically sized stuff */
 	max_reqnum += 2; /* account for 2 first "fake" clients */
 	if (max_reqnum < 8) max_reqnum = 8; /* sanitize */
-	if (max_reqnum > 0xffff) max_reqnum = 0xffff;
-	log(L_DEBUG, "will handle %u requests in parallel", max_reqnum - 2);
+	/* Since refcount is a byte, can't serve more than 255-2 clients
+	 * at once. The rest will block in connect() */
+	if (max_reqnum > 0xff) max_reqnum = 0xff;
 	client_buf = xzalloc(max_reqnum * sizeof(client_buf[0]));
 	busy_cbuf  = xzalloc(max_reqnum * sizeof(busy_cbuf[0]));
 	pfd        = xzalloc(max_reqnum * sizeof(pfd[0]));
 	cinfo      = xzalloc(max_reqnum * sizeof(cinfo[0]));
 
 	cache_size = (config.size[0] + config.size[1] + config.size[2]) / 8;
-	if (cache_size < 64) cache_size = 64; /* 8*64 = 512 entries min */
+	if (cache_size < 8) cache_size = 8; /* 8*8 = 64 entries min */
 	if (cache_size > 0xffff) cache_size = 0xffff; /* 8*64k entries max */
 	cache_size |= 1; /* force it to be odd */
-	log(L_DEBUG, "cache size %u x 8 entries", cache_size);
 	cache = xzalloc(cache_size * sizeof(cache[0]));
-
-	/* Make sure stdio is not closed */
-	n = xopen3("/dev/null", O_RDWR, 0);
-	while (n < 2)
-		n = dup(n);
-	/* Close unexpected open file descriptors */
-	n |= 0xff; /* start from at least fd# 255 */
-	do {
-		close(n--);
-	} while (n > 2);
 
 	/* Register cleanup hooks */
 	signal(SIGINT, cleanup_on_signal);
@@ -2331,9 +2491,11 @@ int main(int argc, char **argv)
 	mkdir(NSCD_DIR, 0755);
 	pfd[0].fd = open_socket(NSCD_SOCKET);
 	pfd[1].fd = open_socket(NSCD_SOCKET_OLD);
+if (pfd[0].fd < 3 || pfd[1].fd < 3 || pfd[0].fd > 4 || pfd[1].fd > 4)
+ perror_and_die("bad listening fds:%d,%d", pfd[0].fd, pfd[1].fd);
 	pfd[0].events = POLLIN;
 	pfd[1].events = POLLIN;
-	
+
 	if (debug & D_DAEMON) {
 		daemon(/*nochdir*/ 1, /*noclose*/ 0);
 		if (config.logfile) {
@@ -2352,6 +2514,10 @@ int main(int argc, char **argv)
 		signal(SIGTSTP, SIG_IGN);
 	}
 
+	log(L_ALL, "nscd v" PROGRAM_VERSION ", debug level 0x%x", debug & L_ALL);
+	log(L_DEBUG, "max %u requests in parallel", max_reqnum - 2);
+	log(L_DEBUG, "cache size %u x 8 entries", cache_size);
+
 	if (env_U) {
 		int size;
 		gid_t *ug = env_U_to_uid_and_gids(env_U, &size);
@@ -2362,21 +2528,12 @@ int main(int argc, char **argv)
 		free(ug);
 	}
 
-	log(L_ALL, "nscd v" PROGRAM_VERSION ", debug level %x", debug & L_ALL);
-	log(L_DEBUG, "passwd cache: %d pttl %u nttl %u",
-				config.srv_enable[SRV_PASSWD],
-				config.pttl[SRV_PASSWD],
-				config.nttl[SRV_PASSWD]);
-	log(L_DEBUG, " group cache: %d pttl %u nttl %u",
-				config.srv_enable[SRV_GROUP ],
-				config.pttl[SRV_GROUP],
-				config.nttl[SRV_GROUP]);
-	log(L_DEBUG, " hosts cache: %d pttl %u nttl %u",
-				config.srv_enable[SRV_HOSTS ],
-				config.pttl[SRV_HOSTS],
-				config.nttl[SRV_HOSTS]);
-
 	for (n = 0; n < 3; n++) {
+		log(L_DEBUG, "%s cache enabled:%u pttl:%u nttl:%u",
+				srv_name[n],
+				config.srv_enable[n],
+				config.pttl[n],
+				config.nttl[n]);
 		config.pttl[n] *= 1000;
 		config.nttl[n] *= 1000;
 	}
