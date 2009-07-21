@@ -126,8 +126,10 @@ vda.linux@googlemail.com
  * 0.38 log POLLHUP better
  * 0.39 log answers to client better, log getpwnam in the worker,
  *      pass debug level value down to worker.
+ * 0.40 fix handling of shutdown and invalidate requests;
+ *      fix bug with answer written in several pieces
  */
-#define PROGRAM_VERSION "0.39"
+#define PROGRAM_VERSION "0.40"
 
 #define DEBUG_BUILD 1
 
@@ -613,7 +615,8 @@ static int unsupported_ureq_type(unsigned type)
 {
 	if (type == GETAI) return 0;
 	if (type == INITGROUPS) return 0;
-	if (type > GETHOSTBYADDRv6) return 1;
+	if (type == GETSTAT) return 1;
+	if (type > INVALIDATE) return 1;
 	return 0;
 }
 
@@ -1001,7 +1004,7 @@ static ai_response_header *obtain_addrinfo(const char *hostname)
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_flags = AI_CANONNAME;
-	/* hinst.ai_socktype = SOCK_STREAM; - can kill dups (one for each possible SOCK_xxx) */
+	/* hints.ai_socktype = SOCK_STREAM; - can kill dups (one for each possible SOCK_xxx) */
 	ai = NULL; /* on failure getaddrinfo may leave it as-is */
 	err = getaddrinfo(hostname, NULL, &hints, &ai);
 
@@ -1421,6 +1424,26 @@ static int handle_client(int i)
 			ureq->key_len, req_str(ureq->type, ureq->reqbuf));
 	hex_dump(cinfo[i].ureq, cinfo[i].bytecnt);
 
+	if (ureq->version != NSCD_VERSION) {
+		log(L_INFO, "wrong version");
+		close_client(i);
+		return 0;
+	}
+	if (ureq->key_len > sizeof(ureq->reqbuf)) {
+		log(L_INFO, "bogus key_len %u - ignoring", ureq->key_len);
+		close_client(i);
+		return 0;
+	}
+	if (cinfo[i].bytecnt < USER_HDR_SIZE + ureq->key_len) {
+		log(L_INFO, "read %d, need to read %d",
+			cinfo[i].bytecnt, USER_HDR_SIZE + ureq->key_len);
+		return 0; /* more to read */
+	}
+	if (cinfo[i].bytecnt > USER_HDR_SIZE + ureq->key_len) {
+		log(L_INFO, "read overflow");
+		close_client(i);
+		return 0;
+	}
 	if (unsupported_ureq_type(ureq->type)) {
 		/* We don't know this request. Just close the connection */
 		/* (glibc client interprets this like "not supported by this nscd") */
@@ -1435,21 +1458,39 @@ static int handle_client(int i)
 		return 0;
 	}
 
-	if (cinfo[i].bytecnt < USER_HDR_SIZE + ureq->key_len) {
-		log(L_INFO, "read %d, need %d more to read",
-			cinfo[i].bytecnt, USER_HDR_SIZE + ureq->key_len);
-		return 0; /* more to read */
-	}
-	if (cinfo[i].bytecnt > USER_HDR_SIZE + ureq->key_len) {
-		log(L_INFO, "read overflow");
+	if (ureq->type == SHUTDOWN
+	 || ureq->type == INVALIDATE
+	) {
+#ifdef SO_PEERCRED
+		struct ucred caller;
+		socklen_t optlen = sizeof(caller);
+		if (getsockopt(pfd[i].fd, SOL_SOCKET, SO_PEERCRED, &caller, &optlen) < 0) {
+			log(L_INFO, "ignoring special request - cannot get caller's id: %s", strerror(errno));
+			close_client(i);
+			return 0;
+		}
+		if (caller.uid != 0) {
+			log(L_INFO, "special request from non-root - ignoring");
+			close_client(i);
+			return 0;
+		}
+#endif
+		if (ureq->type == SHUTDOWN) {
+			log(L_INFO, "got shutdown request, exiting");
+			exit(0);
+		}
+		if (!ureq->key_len || ureq->reqbuf[ureq->key_len - 1]) {
+			log(L_INFO, "malformed invalidate request - ignoring");
+			close_client(i);
+			return 0;
+		}
+		log(L_INFO, "got invalidate request, flushing cache");
+		/* Frees entire cache. TODO: replace -1 with service (in ureq->reqbuf) */
+		age_cache(0, -1);
 		close_client(i);
 		return 0;
 	}
-	if (ureq->version != NSCD_VERSION) {
-		log(L_INFO, "wrong version");
-		close_client(i);
-		return 0;
-	}
+
 	if (ureq->type != GETHOSTBYADDR
 	 && ureq->type != GETHOSTBYADDRv6
 	) {
@@ -1666,7 +1707,7 @@ static void main_loop(void)
 				resp = ureq_response(cinfo[i].resptr);
 				resp_sz = resp->version_or_size;
 				resp->version_or_size = NSCD_VERSION;
-				r = safe_write(pfd[i].fd, resp + cinfo[i].respos, resp_sz - cinfo[i].respos);
+				r = safe_write(pfd[i].fd, ((char*) resp) + cinfo[i].respos, resp_sz - cinfo[i].respos);
 				resp->version_or_size = resp_sz;
 
 				if (r < 0 && errno == EAGAIN)
@@ -1674,6 +1715,10 @@ static void main_loop(void)
 				if (r <= 0) { /* client isn't there anymore */
 					log(L_DEBUG, "client %d is gone (write returned %d)", i, r);
  write_out_is_done:
+					/* Most of the time, it is not freed here,
+					 * only refcounted--. Freeing happens
+					 * if it was deleted from cache[] but retained
+					 * for writeout. */
 					free_refcounted_ureq(&cinfo[i].resptr);
 					close_client(i);
 					continue;
@@ -1734,44 +1779,6 @@ static void main_loop(void)
 			}
 			cinfo[i].bytecnt += r;
 			if (cinfo[i].bytecnt >= sizeof(user_req_header)) {
-				if (cinfo[i].ureq->type == SHUTDOWN
-				 || cinfo[i].ureq->type == INVALIDATE
-				) {
-					const char *service;
-					unsigned len;
-#ifdef SO_PEERCRED
-					struct ucred caller;
-					socklen_t optlen = sizeof(caller);
-					if (getsockopt(pfd[i].fd, SOL_SOCKET, SO_PEERCRED, &caller, &optlen) < 0) {
-						log(L_INFO, "ignoring special request - cannot get caller's id: %s", strerror(errno));
-						close_client(i);
-						continue;
-					}
-					if (caller.uid != 0) {
-						log(L_INFO, "special request from non-root - ignoring");
-						close_client(i);
-						continue;
-					}
-#endif
-					if (cinfo[i].ureq->type == SHUTDOWN) {
-						log(L_INFO, "got shutdown request, exiting");
-						return; /* exits nscd */;
-					}
-					len = cinfo[i].ureq->key_len;
-					service = (char*)&cinfo[i].ureq + len;
-					if (sizeof(user_req_header) + len != cinfo[i].bytecnt
-					 || !len
-					 || service[len-1] != '\0'
-					) {
-						log(L_INFO, "malformed invalidate request - ignoring");
-						close_client(i);
-						continue;
-					}
-					log(L_INFO, "got invalidate request, flushing cache");
-					age_cache(0, -1); /* frees entire cache. TODO: replace -1 with service */
-					close_client(i);
-					continue;
-				}
 				if (handle_client(i)) {
 					/* Response is found in cache! */
 					goto write_out;
@@ -2178,8 +2185,7 @@ static void special_op(const char *arg)
 
 	if (!arg) { /* shutdown */
 		xfull_write(sock, &ureq, sizeof(ureq));
-		dup2(2, 1);
-		error_and_die("sent shutdown request, exiting");
+		printf("sent shutdown request, exiting\n");
 	} else { /* invalidate */
 		size_t arg_len = strlen(arg) + 1;
 		struct {
@@ -2191,9 +2197,9 @@ static void special_op(const char *arg)
 		reqdata.req.key_len = arg_len;
 		memcpy(reqdata.arg, arg, arg_len);
 		xfull_write(sock, &reqdata, arg_len + sizeof(ureq));
-		dup2(2, 1);
-		error_and_die("sent invalidate(%s) request, exiting", arg);
+		printf("sent invalidate(%s) request, exiting\n", arg);
 	}
+	exit(0);
 }
 
 
@@ -2318,7 +2324,8 @@ int main(int argc, char **argv)
 	signal(SIGALRM, SIG_DFL);
 #endif
 
-	mkdir(NSCD_DIR, 0777);
+	umask(0); /* prevent bad mode of NSCD_DIR if umask is e.g. 077 */
+	mkdir(NSCD_DIR, 0755);
 	pfd[0].fd = open_socket(NSCD_SOCKET);
 	pfd[1].fd = open_socket(NSCD_SOCKET_OLD);
 	pfd[0].events = POLLIN;
@@ -2345,7 +2352,7 @@ int main(int argc, char **argv)
 	if (env_U) {
 		int size;
 		gid_t *ug = env_U_to_uid_and_gids(env_U, &size);
-		if (setgroups(size, &ug[1]))
+		if (setgroups(size, &ug[1]) || setgid(ug[1]))
 			perror_and_die("cannot set groups for user '%s'", config.user);
 		if (setuid(ug[0]))
 			perror_and_die("cannot set uid to %u", (unsigned)(ug[0]));
