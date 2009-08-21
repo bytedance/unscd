@@ -131,8 +131,9 @@ vda.linux@googlemail.com
  * 0.40.1 set hints.ai_socktype = SOCK_STREAM in GETAI request
  * 0.41   eliminate double caching of two near-simultaneous identical requests -
  *        EXPERIMENTAL
+ * 0.42   execute /proc/self/exe by link name first (better comm field)
  */
-#define PROGRAM_VERSION "0.41"
+#define PROGRAM_VERSION "0.42"
 
 #define DEBUG_BUILD 1
 
@@ -667,7 +668,8 @@ static client_info   *cinfo;
  * Cache entries have this format: request, then padding to 32 bits,
  * then the response.
  * Addresses in cache[x][y] may be NULL or:
- * (&client_buf[z]) & 1: the cache miss is in progress ("future entry")
+ * (&client_buf[z]) & 1: the cache miss is in progress ("future entry"):
+ * "the data is not in the cache (yet), wait for it to appear"
  * (&client_buf[z]) & 3: the cache miss is in progress and other clients
  * also want the same data ("shared future entry")
  * else (non-NULL but low two bits are 0): cached data in malloc'ed block
@@ -678,7 +680,7 @@ static client_info   *cinfo;
  *      .fd: open fd to a client, for reading client's request, or
  *      .fd: open fd to a worker, to send request and get response back
  * cinfo[i] - auxiliary client data for pfd[i]
- *      .client_fd: open fd to a client, in case we already has read its
+ *      .client_fd: open fd to a client, in case we already had read its
  *          request and got a cache miss, and created a worker or
  *          wait for another client's worker.
  *          Otherwise, it's 0 and client's fd is in pfd[i].fd
@@ -707,7 +709,7 @@ static client_info   *cinfo;
 
 /* Are special bits 0? is it a true cached entry? */
 #define CACHED_ENTRY(p)     ( ((long)(p) & 3) == 0 )
-/* Are apecial bits 11? is it a shared future cache entry? */
+/* Are special bits 11? is it a shared future cache entry? */
 #define CACHE_SHARED(p)     ( ((long)(p) & 3) == 3 )
 /* Return a ptr with special bits cleared (used for accessing data) */
 #define CACHE_PTR(p)        ( (void*) ((long)(p) & ~(long)3) )
@@ -1330,8 +1332,11 @@ static int create_and_feed_worker(user_req *ureq)
 		/* Re-exec ourself, cleaning up all allocated memory.
 		 * fds in parent are marked CLOEXEC and will be closed too
 		 * (modulo bugs) */
-		execve("/proc/self/exe", argv, argv+2);
-		xexecve(self_exe_points_to, argv, argv+2);
+		/* Try link name first: it's better to have comm field
+		 * of "nscd" than "exe" (pgrep reported to fail to find us
+		 * by name when comm field contains "exe") */
+		execve(self_exe_points_to, argv, argv+2);
+		xexecve("/proc/self/exe", argv, argv+2);
 	}
 
 	/* parent */
@@ -1630,7 +1635,6 @@ static int handle_client(int i)
 	/* Now we will wait on worker's fd, not client's! */
 	cinfo[i].client_fd = pfd[i].fd;
 	pfd[i].fd = create_and_feed_worker(ureq);
-log(L_DEBUG, "A pfd[%d].fd=%d", i, pfd[i].fd);
 	return 0;
 }
 
@@ -1640,7 +1644,6 @@ static void prepare_for_writeout(unsigned i, user_req *cached)
 
 	if (cinfo[i].client_fd) {
 		pfd[i].fd = cinfo[i].client_fd;
-log(L_DEBUG, "B pfd[%d].fd=%d", i, pfd[i].fd);
 		cinfo[i].client_fd = 0; /* "we don't wait for worker reply" */
 	}
 	pfd[i].events = POLLOUT;
@@ -1770,8 +1773,7 @@ static void main_loop(void)
 			r = -1; /* infinite */
 		else if (num_clients < max_reqnum)
 			r = aging_interval_ms;
-// 0.41 is experimental, turning on:
-#if 1 /* Debug: leak detector */
+#if 0 /* Debug: leak detector */
 		{
 			static unsigned long long cnt;
 			static unsigned long low_malloc = -1L;
@@ -1818,8 +1820,6 @@ static void main_loop(void)
 			cfd = accept(pfd[i].fd, NULL, NULL);
 			if (cfd < 0) {
 				/* odd... poll() says we can accept but accept failed? */
-if (pfd[i].fd < 3 || pfd[i].fd > 4)
- perror_and_die("bad listening fd[%d]:%d", i, pfd[i].fd);
 				log(L_DEBUG2, "accept failed with %s", strerror(errno));
 				continue;
 			}
@@ -1828,7 +1828,6 @@ if (pfd[i].fd < 3 || pfd[i].fd > 4)
 			/* x[num_clients] is next free element, taking it */
 			log(L_DEBUG2, "new client %d, fd %d", num_clients, cfd);
 			pfd[num_clients].fd = cfd;
-log(L_DEBUG, "C pfd[%d].fd=%d", num_clients, pfd[num_clients].fd);
 			pfd[num_clients].events = POLLIN;
 			/* this will make us do read() in next for() loop: */
 			pfd[num_clients].revents = POLLIN;
@@ -2454,8 +2453,8 @@ int main(int argc, char **argv)
 		if (putenv(user_to_env_U(config.user)))
 			error_and_die("out of memory");
 		/* fds leaked by nss will be closed by execed copy */
-		execv("/proc/self/exe", argv);
-		xexecve(self_exe_points_to, argv, environ);
+		execv(self_exe_points_to, argv);
+		xexecve("/proc/self/exe", argv, environ);
 	}
 
 	/* Allocate dynamically sized stuff */
@@ -2491,8 +2490,6 @@ int main(int argc, char **argv)
 	mkdir(NSCD_DIR, 0755);
 	pfd[0].fd = open_socket(NSCD_SOCKET);
 	pfd[1].fd = open_socket(NSCD_SOCKET_OLD);
-if (pfd[0].fd < 3 || pfd[1].fd < 3 || pfd[0].fd > 4 || pfd[1].fd > 4)
- perror_and_die("bad listening fds:%d,%d", pfd[0].fd, pfd[1].fd);
 	pfd[0].events = POLLIN;
 	pfd[1].events = POLLIN;
 
