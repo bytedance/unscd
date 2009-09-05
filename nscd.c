@@ -132,8 +132,9 @@ vda.linux@googlemail.com
  * 0.41   eliminate double caching of two near-simultaneous identical requests -
  *        EXPERIMENTAL
  * 0.42   execute /proc/self/exe by link name first (better comm field)
+ * 0.43   fix off-by-one error in setgroups
  */
-#define PROGRAM_VERSION "0.42"
+#define PROGRAM_VERSION "0.43"
 
 #define DEBUG_BUILD 1
 
@@ -2518,10 +2519,12 @@ int main(int argc, char **argv)
 	if (env_U) {
 		int size;
 		gid_t *ug = env_U_to_uid_and_gids(env_U, &size);
-		if (setgroups(size, &ug[1]) || setgid(ug[1]))
-			perror_and_die("cannot set groups for user '%s'", config.user);
-		if (setuid(ug[0]))
-			perror_and_die("cannot set uid to %u", (unsigned)(ug[0]));
+		if (size > 1)
+			if (setgroups(size - 1, &ug[1]) || setgid(ug[1]))
+				perror_and_die("cannot set groups for user '%s'", config.user);
+		if (size > 0)
+			if (setuid(ug[0]))
+				perror_and_die("cannot set uid to %u", (unsigned)(ug[0]));
 		free(ug);
 	}
 
