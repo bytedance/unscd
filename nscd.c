@@ -137,8 +137,9 @@ vda.linux@googlemail.com
  *        how to produce detailed log (no nscd.conf tweaking)
  * 0.45   Fix out-of-bounds array access and log/pid file permissions -
  *        thanks to Sebastian Krahmer (krahmer AT suse.de)
+ * 0.46   fix a case when we forgot to remove a future entry on worker failure
  */
-#define PROGRAM_VERSION "0.45"
+#define PROGRAM_VERSION "0.46"
 
 #define DEBUG_BUILD 1
 
@@ -1628,6 +1629,7 @@ static int handle_client(int i)
 		/* Not found. Remember a pointer where it will appear */
 		cinfo[i].cache_pp = cache_pp;
 
+		/* If it does not point to our own ureq buffer... */
 		if (CACHE_PTR(ureq_and_resp) != ureq) {
 			/* We are not the first client who wants this */
 			log(L_DEBUG, "another request is in progress (%p), waiting for its result", ureq_and_resp);
@@ -1804,7 +1806,7 @@ static void main_loop(void)
 			cnt++;
 		}
 #else
-		log(L_DEBUG, "poll (%d ms). clients:%u cached:%u hit ratio:%u/%u",
+		log(L_DEBUG, "poll %d ms. clients:%u cached:%u hit ratio:%u/%u",
 				r, num_clients, cached_cnt, cache_hit_cnt, cache_access_cnt);
 #endif
 
@@ -1920,10 +1922,25 @@ static void main_loop(void)
 				goto write_out;
 			}
 
-			if (pfd[i].revents == POLLHUP) {
-				/* POLLHUP means we can't write to it anymore */
-				log(L_INFO, "client %u disappered (got POLLHUP)", i);
-				close_client(i);
+			/* POLLHUP means pfd[i].fd is closed by peer.
+			 * POLLHUP+POLLOUT is seen when we switch for writeout
+			 * and see that pfd[i].fd is closed by peer. */
+			if ((pfd[i].revents & ~POLLOUT) == POLLHUP) {
+				int is_client = (cinfo[i].client_fd == 0 || cinfo[i].client_fd == pfd[i].fd);
+				log(L_INFO, "%s %u disappeared (got POLLHUP on fd %d)",
+					is_client ? "client" : "worker",
+					i,
+					pfd[i].fd
+				);
+				if (is_client)
+					close_client(i);
+				else {
+					/* Read worker output anyway, error handling
+					 * in that function deals with short read.
+					 * Simply closing client is wrong: it leaks
+					 * shared future entries. */
+					handle_worker_response(i);
+				}
 				continue;
 			}
 
