@@ -133,8 +133,10 @@ vda.linux@googlemail.com
  *        EXPERIMENTAL
  * 0.42   execute /proc/self/exe by link name first (better comm field)
  * 0.43   fix off-by-one error in setgroups
+ * 0.44   make -d[ddd] bump up debug - easier to explain to users
+ *        how to produce detailed log (no nscd.conf tweaking)
  */
-#define PROGRAM_VERSION "0.43"
+#define PROGRAM_VERSION "0.44"
 
 #define DEBUG_BUILD 1
 
@@ -2373,6 +2375,7 @@ void __nss_disable_nscd(void);
 int main(int argc, char **argv)
 {
 	int n;
+	unsigned opt_d_cnt;
 	const char *env_U;
 	const char *conffile;
 
@@ -2399,9 +2402,11 @@ int main(int argc, char **argv)
 	readlink_self_exe();
 
 	conffile = default_conffile;
+	opt_d_cnt = 0;
 	while ((n = getopt_long(argc, argv, "df:i:KVgt:", longopt, NULL)) != -1) {
 		switch (n) {
 		case 'd':
+			opt_d_cnt++;
 			debug &= ~D_DAEMON;
 			break;
 		case 'f':
@@ -2429,6 +2434,11 @@ int main(int argc, char **argv)
 			print_help_and_die();
 		}
 	}
+	/* Multiple -d can bump debug regardless of nscd.conf:
+	 * no -d or -d: 0, -dd: 1,
+	 * -ddd: 3, -dddd: 7, -ddddd: 15
+	 */
+	debug |= (((1U << opt_d_cnt) >> 1) - 1) & L_ALL;
 
 	env_U = getenv("U");
 	/* Avoid duplicate warnings if $U exists */
