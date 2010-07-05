@@ -138,8 +138,9 @@ vda.linux@googlemail.com
  * 0.45   Fix out-of-bounds array access and log/pid file permissions -
  *        thanks to Sebastian Krahmer (krahmer AT suse.de)
  * 0.46   fix a case when we forgot to remove a future entry on worker failure
+ * 0.47   fix nscd without -d to not bump debug level
  */
-#define PROGRAM_VERSION "0.46"
+#define PROGRAM_VERSION "0.47"
 
 #define DEBUG_BUILD 1
 
@@ -2464,7 +2465,8 @@ int main(int argc, char **argv)
 	 * no -d or -d: 0, -dd: 1,
 	 * -ddd: 3, -dddd: 7, -ddddd: 15
 	 */
-	debug |= (((1U << opt_d_cnt) >> 1) - 1) & L_ALL;
+	if (opt_d_cnt != 0)
+		debug |= (((1U << opt_d_cnt) >> 1) - 1) & L_ALL;
 
 	env_U = getenv("U");
 	/* Avoid duplicate warnings if $U exists */
