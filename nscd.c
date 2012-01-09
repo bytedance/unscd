@@ -139,8 +139,9 @@ vda.linux@googlemail.com
  *        thanks to Sebastian Krahmer (krahmer AT suse.de)
  * 0.46   fix a case when we forgot to remove a future entry on worker failure
  * 0.47   fix nscd without -d to not bump debug level
+ * 0.48   fix for changes in __nss_disable_nscd API in glibc-2.15
  */
-#define PROGRAM_VERSION "0.47"
+#define PROGRAM_VERSION "0.48"
 
 #define DEBUG_BUILD 1
 
@@ -2097,7 +2098,7 @@ static const struct option longopt[] = {
 };
 
 static const char *const help[] = {
-	"Do not daemonize; log to stderr",
+	"Do not daemonize; log to stderr (-dd: more verbosity)",
 	"File to read configuration from",
 	"Invalidate cache",
 	"Shut the server down",
@@ -2347,6 +2348,7 @@ static char* user_to_env_U(const char *user)
 
 
 /* not static - don't inline me, compiler! */
+void readlink_self_exe(void);
 void readlink_self_exe(void)
 {
 	char buf[PATH_MAX + 1];
@@ -2395,9 +2397,24 @@ static void special_op(const char *arg)
 }
 
 
+/* Callback for glibc-2.15 */
+struct traced_file;
+static void do_nothing(size_t dbidx, struct traced_file *finfo)
+{
+	/* nscd from glibc-2.15 does something like this:
+	if (!dbs[dbidx].enabled || !dbs[dbidx].check_file)
+		return;
+	add_file_to_watch_list(finfo->fname);
+	*/
+}
+
 /* This internal glibc function is called to disable trying to contact nscd.
- * We _are_ nscd, so we need to do the lookups, and not recurse. */
-void __nss_disable_nscd(void);
+ * We _are_ nscd, so we need to do the lookups, and not recurse.
+ * Until 2.14, this function was taking no parameters.
+ * In 2.15, it takes a function pointer from hell.
+ */
+void __nss_disable_nscd(void (*hell)(size_t, struct traced_file*));
+
 
 int main(int argc, char **argv)
 {
@@ -2407,7 +2424,7 @@ int main(int argc, char **argv)
 	const char *conffile;
 
 	/* make sure we don't get recursive calls */
-	__nss_disable_nscd();
+	__nss_disable_nscd(do_nothing);
 
 	if (argv[0][0] == 'w') /* "worker_nscd" */
 		worker(argv[1]);
