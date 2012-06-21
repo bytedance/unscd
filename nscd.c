@@ -1,5 +1,6 @@
 /* This file is part of unscd, a complete nscd replacement.
- * Copyright (C) 2007 Denys Vlasenko. Licensed under the GPL version 2. */
+ * Copyright (C) 2007-2012 Denys Vlasenko. Licensed under the GPL version 2.
+ */
 
 /* unscd is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -140,8 +141,9 @@ vda.linux@googlemail.com
  * 0.46   fix a case when we forgot to remove a future entry on worker failure
  * 0.47   fix nscd without -d to not bump debug level
  * 0.48   fix for changes in __nss_disable_nscd API in glibc-2.15
+ * 0.49   minor tweaks to messages
  */
-#define PROGRAM_VERSION "0.48"
+#define PROGRAM_VERSION "0.49"
 
 #define DEBUG_BUILD 1
 
@@ -1520,7 +1522,7 @@ static int handle_client(int i)
 #if DEBUG_BUILD
 	log(L_DEBUG, "version:%d type:%d(%s) key_len:%d '%s'",
 			ureq->version, ureq->type,
-			ureq->type < ARRAY_SIZE(typestr) ? typestr[ureq->type] : "BAD",
+			ureq->type < ARRAY_SIZE(typestr) ? typestr[ureq->type] : "?",
 			ureq->key_len, req_str(ureq->type, ureq->reqbuf));
 #endif
 
@@ -1540,7 +1542,8 @@ static int handle_client(int i)
 		return 0; /* more to read */
 	}
 	if (cinfo[i].bytecnt > USER_HDR_SIZE + ureq->key_len) {
-		log(L_INFO, "read overflow");
+		log(L_INFO, "read overflow: %u > %u",
+			(int)cinfo[i].bytecnt, (int)(USER_HDR_SIZE + ureq->key_len));
 		close_client(i);
 		return 0;
 	}
@@ -1700,14 +1703,18 @@ static void handle_worker_response(int i)
 	}
 
 	resp_sz = sz_and_found.version_or_size;
-	if (resp_sz < sz || resp_sz > 0xfffffff) { /* 256 mb */
+	if (resp_sz < sz || resp_sz > 0x0fffffff) { /* 256 mb */
 		error("BUG: bad size from worker:%u", resp_sz);
 		goto err;
 	}
 
 	/* Create new block of cached info */
 	cached = xzalloc(ureq_sz_aligned + resp_sz);
-	log(L_DEBUG2, "xzalloc(%u):%p", ureq_sz_aligned + resp_sz, cached);
+	log(L_DEBUG2, "xzalloc(%u):%p sz:%u resp_sz:%u found:%u",
+			ureq_sz_aligned + resp_sz, cached,
+			sz, resp_sz,
+			(int)sz_and_found.found
+			);
 	resp = (void*) (((char*) cached) + ureq_sz_aligned);
 	memcpy(cached, ureq, ureq_size(ureq));
 	memcpy(resp, &sz_and_found, sz);
@@ -1878,13 +1885,15 @@ static void main_loop(void)
 				resp = ureq_response(cinfo[i].resptr);
 				resp_sz = resp->version_or_size;
 				resp->version_or_size = NSCD_VERSION;
+				errno = 0;
 				r = safe_write(pfd[i].fd, ((char*) resp) + cinfo[i].respos, resp_sz - cinfo[i].respos);
 				resp->version_or_size = resp_sz;
 
 				if (r < 0 && errno == EAGAIN)
 					continue;
 				if (r <= 0) { /* client isn't there anymore */
-					log(L_DEBUG, "client %d is gone (write returned %d)", i, r);
+					log(L_DEBUG, "client %d is gone (write returned:%d err:%s)",
+							i, r, errno ? strerror(errno) : "-");
  write_out_is_done:
 					if (cinfo[i].cache_pp == NULL) {
 						log(L_DEBUG, "client %d: freeing fake cache entry %p", i, cinfo[i].resptr);
@@ -2569,7 +2578,7 @@ int main(int argc, char **argv)
 		signal(SIGTSTP, SIG_IGN);
 	}
 
-	log(L_ALL, "nscd v" PROGRAM_VERSION ", debug level 0x%x", debug & L_ALL);
+	log(L_ALL, "unscd v" PROGRAM_VERSION ", debug level 0x%x", debug & L_ALL);
 	log(L_DEBUG, "max %u requests in parallel", max_reqnum - 2);
 	log(L_DEBUG, "cache size %u x 8 entries", cache_size);
 
