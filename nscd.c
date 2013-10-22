@@ -142,8 +142,9 @@ vda.linux@googlemail.com
  * 0.47   fix nscd without -d to not bump debug level
  * 0.48   fix for changes in __nss_disable_nscd API in glibc-2.15
  * 0.49   minor tweaks to messages
+ * 0.50   add more files to watch for changes
  */
-#define PROGRAM_VERSION "0.49"
+#define PROGRAM_VERSION "0.50"
 
 #define DEBUG_BUILD 1
 
@@ -1484,10 +1485,14 @@ static void worker(const char *param)
 ** Main loop
 */
 
-static const char checked_filenames[][sizeof("/etc/passwd")] = {
-	[SRV_PASSWD] = "/etc/passwd", /*  "/etc/shadow"? */
-	[SRV_GROUP]  = "/etc/group",
-	[SRV_HOSTS]  = "/etc/hosts", /* "/etc/resolv.conf" "/etc/nsswitch.conf"? */
+static const char *const checked_filenames[] = {
+	/* Note: compiler adds another \0 byte at the end of each array element,
+	 * so there are TWO \0's there.
+	 */
+	[SRV_PASSWD] = "/etc/passwd\0" "/etc/passwd.cache\0" "/etc/shadow\0",
+	[SRV_GROUP]  = "/etc/group\0"  "/etc/group.cache\0",
+	[SRV_HOSTS]  = "/etc/hosts\0"  "/etc/hosts.cache\0"  "/etc/resolv.conf\0"  "/etc/nsswitch.conf\0",
+	/* ("foo.cache" files are maintained by libnss-cache) */
 };
 
 static long checked_status[ARRAY_SIZE(checked_filenames)];
@@ -1498,15 +1503,20 @@ static void check_files(int srv)
 	const char *file = checked_filenames[srv];
 	long v;
 
-	memset(&tsb, 0, sizeof(tsb));
-	stat(file, &tsb); /* ignore errors */
-	/* Comparing struct stat's was giving false positives.
-	 * Extracting only those fields which are interesting: */
-	v = (long)tsb.st_mtime ^ (long)tsb.st_size ^ (long)tsb.st_ino; /* ^ (long)tsb.st_dev ? */
+	v = 0;
+	do {
+		memset(&tsb, 0, sizeof(tsb));
+		stat(file, &tsb); /* ignore errors */
+		/* Comparing struct stat's was giving false positives.
+		 * Extracting only those fields which are interesting:
+		 */
+		v ^= (long)tsb.st_mtime ^ (long)tsb.st_size ^ (long)tsb.st_ino; /* ^ (long)tsb.st_dev ? */
+		file += strlen(file) + 1;
+	} while (file[0]);
 
 	if (v != checked_status[srv]) {
 		checked_status[srv] = v;
-		log(L_INFO, "detected change in %s", file);
+		log(L_INFO, "detected change in files related to service %d", srv);
 		age_cache(/*free_all:*/ 1, srv);
 	}
 }
