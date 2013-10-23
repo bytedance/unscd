@@ -143,8 +143,9 @@ vda.linux@googlemail.com
  * 0.48   fix for changes in __nss_disable_nscd API in glibc-2.15
  * 0.49   minor tweaks to messages
  * 0.50   add more files to watch for changes
+ * 0.51   fix a case where we forget to refcount-- the cached entry
  */
-#define PROGRAM_VERSION "0.50"
+#define PROGRAM_VERSION "0.51"
 
 #define DEBUG_BUILD 1
 
@@ -666,6 +667,10 @@ static int num_clients = 2; /* two listening sockets are "clients" too */
 /* We read up to max_reqnum requests in parallel */
 static unsigned max_reqnum = 14;
 static int next_buf;
+/* To be allocated at init to become client_buf[max_reqnum][MAX_USER_REQ_SIZE].
+ * Note: it is a pointer to [MAX_USER_REQ_SIZE] arrays,
+ * not [MAX_USER_REQ_SIZE] array of pointers.
+ */
 static char          (*client_buf)[MAX_USER_REQ_SIZE];
 static char          *busy_cbuf;
 static struct pollfd *pfd;
@@ -698,12 +703,17 @@ static client_info   *cinfo;
  *          wait for another client's worker.
  *          Otherwise, it's 0 and client's fd is in pfd[i].fd
  *      .bufidx: index in client_buf[] we store client's request in
+ *      .ureq: = client_buf[bufidx]
  *      .bytecnt: size of the request
  *      .started_ms: used to time out unresponsive clients
- *      .respos:
- *      .resptr:
- *      .cache_pp: &cache[x][y] where the response is, or will be stored.
- *      .ureq:
+ *      .resptr: initially NULL. Later, same as cache[x][y] pointer to a cached
+ *          response, or (a rare case) a "fake cache" entry:
+ *          all cache[hash(request)][0..7] blocks were found busy,
+ *          the result won't be cached.
+ *      .respos: "write-out to client" offset
+ *      .cache_pp: initially NULL. Later, &cache[x][y] where the response is,
+ *          or will be stored. Remains NULL if "fake cache" entry is in use
+ *
  * When a client has received its reply (or otherwise closed (timeout etc)),
  * corresponding pfd[i] and cinfo[i] are removed by shifting [i+1], [i+2] etc
  * elements down, so that both arrays never have free holes.
@@ -767,17 +777,36 @@ static inline void *bufno2buf(int i)
 	return client_buf[i];
 }
 
+static void free_refcounted_ureq(user_req **ureqp);
+
 static void close_client(unsigned i)
 {
 	log(L_DEBUG, "closing client %u (fd %u,%u)", i, pfd[i].fd, cinfo[i].client_fd);
 	/* Paranoia. We had nasty bugs where client was closed twice. */
-	if (pfd[i].fd == 0) ////
+	if (pfd[i].fd == 0)
 		return;
+
 	close(pfd[i].fd);
 	if (cinfo[i].client_fd && cinfo[i].client_fd != pfd[i].fd)
 		close(cinfo[i].client_fd);
 	pfd[i].fd = 0; /* flag as unused (coalescing needs this) */
 	busy_cbuf[cinfo[i].bufidx] = 0;
+
+	if (cinfo[i].cache_pp == NULL) {
+		user_req *resptr = cinfo[i].resptr;
+		if (resptr) {
+			log(L_DEBUG, "client %u: freeing fake cache entry %p", i, resptr);
+			free(resptr);
+		}
+	} else {
+		/* Most of the time, it is not freed here,
+		 * only refcounted--. Freeing happens
+		 * if it was deleted from cache[] but retained
+		 * for writeout.
+		 */
+		free_refcounted_ureq(&cinfo[i].resptr);
+	}
+
 	cnt_closed++;
 	if (i < min_closed)
 		min_closed = i;
@@ -1189,8 +1218,9 @@ static void free_refcounted_ureq(user_req **ureqp)
 
 	if (ureq->refcount) {
 		ureq->refcount--;
+		log(L_DEBUG2, "--%p.refcount=%u", ureq, ureq->refcount);
 	} else {
-		log(L_DEBUG2, "refcount == 0, free(%p)", ureq);
+		log(L_DEBUG2, "%p.refcount=0, freeing", ureq);
 		free(ureq);
 	}
 	*ureqp = NULL;
@@ -1632,7 +1662,11 @@ static int handle_client(int i)
 
 			log(L_DEBUG, "sz:%u", sz);
 			hex_dump(resp, sz);
-			ureq_and_resp->refcount++; /* cache shouldn't free it under us! */
+			/* cache shouldn't free it under us! */
+			if (++ureq_and_resp->refcount == 0) {
+				error_and_die("BUG! ++%p.refcount rolled over to 0, exiting", ureq_and_resp);
+			}
+			log(L_DEBUG2, "++%p.refcount=%u", ureq_and_resp, ureq_and_resp->refcount);
 			pfd[i].events = POLLOUT; /* we want to write out */
 			cinfo[i].resptr = ureq_and_resp;
 			/*cinfo[i].respos = 0; - already is */
@@ -1783,8 +1817,10 @@ static void handle_worker_response(int i)
 	prepare_for_writeout(i, cached);
 ret:
 	/* cache shouldn't free it under us! */
-	if (cached)
+	if (cached) {
 		cached->refcount = ref;
+		log(L_DEBUG2, "%p.refcount=%u", cached, ref);
+	}
 	aging_interval_ms = min_aging_interval_ms;
 }
 
@@ -1899,22 +1935,13 @@ static void main_loop(void)
 				r = safe_write(pfd[i].fd, ((char*) resp) + cinfo[i].respos, resp_sz - cinfo[i].respos);
 				resp->version_or_size = resp_sz;
 
-				if (r < 0 && errno == EAGAIN)
+				if (r < 0 && errno == EAGAIN) {
+					log(L_DEBUG, "client %u: EAGAIN on write", i);
 					continue;
+				}
 				if (r <= 0) { /* client isn't there anymore */
-					log(L_DEBUG, "client %d is gone (write returned:%d err:%s)",
+					log(L_DEBUG, "client %u is gone (write returned:%d err:%s)",
 							i, r, errno ? strerror(errno) : "-");
- write_out_is_done:
-					if (cinfo[i].cache_pp == NULL) {
-						log(L_DEBUG, "client %d: freeing fake cache entry %p", i, cinfo[i].resptr);
-						free(cinfo[i].resptr);
-					} else {
-						/* Most of the time, it is not freed here,
-						 * only refcounted--. Freeing happens
-						 * if it was deleted from cache[] but retained
-						 * for writeout. */
-						free_refcounted_ureq(&cinfo[i].resptr);
-					}
 					close_client(i);
 					continue;
 				}
@@ -1928,13 +1955,17 @@ static void main_loop(void)
 					 * read(3, "www.google.com\0\0", 16) = 16
 					 * close(3) = 0
 					 */
-					log(L_DEBUG, "client %u: sent answer %u bytes", i, cinfo[i].respos);
-					goto write_out_is_done;
+					log(L_DEBUG, "client %u: sent answer %u/%u/%u bytes", i, r, cinfo[i].respos, resp_sz);
+					close_client(i);
+					continue;
 				}
+				log(L_DEBUG, "client %u: sent partial answer %u/%u/%u bytes", i, r, cinfo[i].respos, resp_sz);
+				continue;
 			}
 
 			/* "Read reply from worker" case. Worker may be
-			 * already dead, revents may contain other bits too */
+			 * already dead, revents may contain other bits too
+			 */
 			if ((pfd[i].revents & POLLIN) && cinfo[i].client_fd) {
 				log(L_DEBUG, "reading response for client %u", i);
 				handle_worker_response(i);
@@ -1944,9 +1975,12 @@ static void main_loop(void)
 			}
 
 			/* POLLHUP means pfd[i].fd is closed by peer.
-			 * POLLHUP+POLLOUT is seen when we switch for writeout
-			 * and see that pfd[i].fd is closed by peer. */
-			if ((pfd[i].revents & ~POLLOUT) == POLLHUP) {
+			 * POLLHUP+POLLOUT[+POLLERR] is seen when we writing out
+			 * and see that pfd[i].fd is closed by peer (for example,
+			 * it happens when client's result buffer is too small
+			 * to receive a huge GETGRBYNAME result).
+			 */
+			if ((pfd[i].revents & ~(POLLOUT+POLLERR)) == POLLHUP) {
 				int is_client = (cinfo[i].client_fd == 0 || cinfo[i].client_fd == pfd[i].fd);
 				log(L_INFO, "%s %u disappeared (got POLLHUP on fd %d)",
 					is_client ? "client" : "worker",
@@ -1968,7 +2002,7 @@ static void main_loop(void)
 			/* All strange and unexpected cases */
 			if (pfd[i].revents != POLLIN) {
 				/* Not just "can read", but some other bits are there */
-				log(L_INFO, "client %u revents is strange:%x", i, pfd[i].revents);
+				log(L_INFO, "client %u revents is strange:0x%x", i, pfd[i].revents);
 				close_client(i);
 				continue;
 			}
@@ -2005,7 +2039,7 @@ static void main_loop(void)
 
 		/* Close timed out client connections */
 		for (i = 2; i < num_clients; i++) {
-			if (pfd[i].fd != 0 /* not closed yet? */ ////
+			if (pfd[i].fd != 0 /* not closed yet? */
 			 && cinfo[i].client_fd == 0 /* do we still wait for client, not worker? */
 			 && (g_now_ms - cinfo[i].started_ms) > CLIENT_TIMEOUT_MS
 			) {
