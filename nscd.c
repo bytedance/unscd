@@ -144,8 +144,9 @@ vda.linux@googlemail.com
  * 0.49   minor tweaks to messages
  * 0.50   add more files to watch for changes
  * 0.51   fix a case where we forget to refcount-- the cached entry
+ * 0.52   make free_refcounted_ureq() tolerant to pointers to NULLs
  */
-#define PROGRAM_VERSION "0.51"
+#define PROGRAM_VERSION "0.52"
 
 #define DEBUG_BUILD 1
 
@@ -1212,6 +1213,10 @@ static uint32_t bernstein_hash(void *p, unsigned sz, uint32_t hash)
 static void free_refcounted_ureq(user_req **ureqp)
 {
 	user_req *ureq = *ureqp;
+
+	/* (when exactly can this happen?) */
+	if (ureq == NULL)
+		return;
 
 	if (!CACHED_ENTRY(ureq))
 		return;
